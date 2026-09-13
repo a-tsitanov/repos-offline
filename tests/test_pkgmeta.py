@@ -1,3 +1,7 @@
+import io
+import json
+import tarfile
+
 import pytest
 
 from offpack.pkgmeta import (
@@ -57,6 +61,32 @@ def test_wheel_platform_tag():
     assert wheel_platform_tag("ruff-0.6.0-py3-none-win_amd64.whl") == "win_amd64"
     assert wheel_platform_tag("six-1.16.0-py2.py3-none-any.whl") == "any"
     assert wheel_platform_tag("six-1.16.0.tar.gz") is None
+
+
+def test_read_npm_tarball_with_non_dict_json(tmp_path):
+    """Test that valid JSON that's not a dict raises PackageMetaError."""
+    tmp_path.mkdir(exist_ok=True)
+    path = tmp_path / "bad-object.tgz"
+    payload = json.dumps([]).encode()  # Valid JSON but not a dict
+    with tarfile.open(path, "w:gz") as archive:
+        info = tarfile.TarInfo("package/package.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    with pytest.raises(PackageMetaError):
+        read_npm_tarball(path)
+
+
+def test_read_npm_tarball_with_invalid_utf8(tmp_path):
+    """Test that invalid UTF-8 in package.json raises PackageMetaError."""
+    tmp_path.mkdir(exist_ok=True)
+    path = tmp_path / "bad-utf8.tgz"
+    payload = b'\x80\x81\x82'  # Invalid UTF-8 bytes
+    with tarfile.open(path, "w:gz") as archive:
+        info = tarfile.TarInfo("package/package.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    with pytest.raises(PackageMetaError):
+        read_npm_tarball(path)
 
 
 def test_normalize_pypi_name():

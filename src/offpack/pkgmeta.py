@@ -51,8 +51,10 @@ def read_npm_tarball(path: Path) -> tuple[str, str]:
             if handle is None:
                 raise PackageMetaError(f"{path.name}: package.json не читается")
             data = json.load(handle)
-    except (tarfile.TarError, OSError, json.JSONDecodeError) as exc:
+    except (tarfile.TarError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PackageMetaError(f"{path.name}: не удалось прочитать ({exc})") from exc
+    if not isinstance(data, dict):
+        raise PackageMetaError(f"{path.name}: package.json не объект")
     name, version = data.get("name"), data.get("version")
     if not isinstance(name, str) or not isinstance(version, str):
         raise PackageMetaError(f"{path.name}: в package.json нет name или version")
