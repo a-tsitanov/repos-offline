@@ -1,0 +1,58 @@
+# Стек песочницы offpack. Имя проекта задаётся через `docker compose -p`.
+services:
+  verdaccio:
+    image: verdaccio/verdaccio:6
+    volumes:
+      - ./verdaccio.yaml:/verdaccio/conf/config.yaml:ro
+      - verdaccio-storage:/verdaccio/storage
+    networks: [sandbox-net, egress]
+
+  devpi:
+    build:
+      context: .
+      dockerfile: devpi.Dockerfile
+    image: offpack-devpi:local
+    volumes:
+      - devpi-data:/data
+    networks: [sandbox-net, egress]
+
+  squid:
+    build:
+      context: .
+      dockerfile: squid.Dockerfile
+    image: offpack-squid:local
+    networks: [sandbox-net, egress]
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: sandbox.Dockerfile
+    image: offpack-sandbox:local
+    command: ["sleep", "infinity"]
+    init: true
+    environment:
+      npm_config_registry: http://verdaccio:4873/
+      UV_DEFAULT_INDEX: http://devpi:3141/root/pypi/+simple/
+      PIP_INDEX_URL: http://devpi:3141/root/pypi/+simple/
+      PIP_TRUSTED_HOST: devpi
+      HTTP_PROXY: http://squid:3128
+      HTTPS_PROXY: http://squid:3128
+      http_proxy: http://squid:3128
+      https_proxy: http://squid:3128
+      NO_PROXY: verdaccio,devpi,localhost,127.0.0.1
+      no_proxy: verdaccio,devpi,localhost,127.0.0.1
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 4g
+    cpus: 2
+    depends_on: [verdaccio, devpi, squid]
+    networks: [sandbox-net]
+
+networks:
+  sandbox-net:
+    internal: true
+  egress: {}
+
+volumes:
+  verdaccio-storage: {}
+  devpi-data: {}

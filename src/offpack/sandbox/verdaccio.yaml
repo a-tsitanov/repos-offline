@@ -1,0 +1,23 @@
+# Прокси к npmjs: сохраняет всё скачанное, публикация запрещена.
+storage: /verdaccio/storage/data
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd
+    max_users: -1
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+    timeout: 60s
+packages:
+  "@*/*":
+    access: $all
+    publish: $nobody
+    proxy: npmjs
+  "**":
+    access: $all
+    publish: $nobody
+    proxy: npmjs
+log:
+  type: stdout
+  format: pretty
+  level: warn
