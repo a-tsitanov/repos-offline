@@ -1,0 +1,241 @@
+# offpack — перенос npm/PyPI-пакетов в офлайн-Nexus
+
+Дата: 2026-09-13
+Статус: черновик на ревью
+
+## Задача
+
+В офлайн-контуре клиенты (`npx`, `npm`, `uv`, `uvx`, `pip`) ставят пакеты из Nexus Repository. Когда нужного пакета нет, оператор на онлайн-машине выполняет ту же команду в изолированной песочнице. Песочница скачивает пакет со всеми транзитивными зависимостями под нужные платформы, результат упаковывается в подписанный архив. Архив переносится в офлайн любым каналом и импортируется в Nexus. После этого исходная команда работает в офлайне без изменений.
+
+## Скоуп v1
+
+Входит:
+
+- CLI `offpack` с командами `build` (онлайн) и `import` (офлайн).
+- Экосистемы: npm и PyPI.
+- Формы команд: `npx`, `npm install`/`npm i`, `npm exec`, `uvx`, `uv tool install`, `uv pip install`, `pip install` с позиционными спецификациями пакетов.
+- Целевые платформы: `linux-x64`, `win-x64`. Версии Python задаются параметром.
+- Неизвестные команды выполняются как есть, но только для платформы песочницы, с предупреждением.
+- Архив `.tar.gz` с манифестом, контрольными суммами, отчётом и подписью.
+- Импорт в hosted-репозитории Nexus через REST API с пропуском дубликатов и исправлением dist-tag `latest`.
+
+Не входит (кандидаты на следующие итерации):
+
+- Установки по проекту: `npm ci`, `uv sync`, `pip install -r requirements.txt`.
+- Очередь заявок, веб-интерфейс, статусы.
+- Сканирование уязвимостей (`osv-scanner`).
+- pnpm, yarn, bun, Docker-образы.
+- Платформы `linux-arm64`, macOS.
+- Захват файлов, которые скачиваются не из реестров (бинарники с GitHub в `postinstall`): v1 только сообщает о них.
+- Захват пакетов, которые инструмент докачивает при первом реальном запуске.
+
+## Архитектура
+
+```
+ОНЛАЙН-МАШИНА                                      ОФЛАЙН-КОНТУР
+
+offpack build -- <команда>                         offpack import <архив>
+  │                                                  │
+  ├─ разбор команды → план установки                 ├─ проверка подписи и SHA256SUMS
+  ├─ docker compose up (стек на одну сборку)         ├─ безопасная распаковка
+  │    sandbox ─► verdaccio ─► registry.npmjs.org     ├─ для каждого файла:
+  │           ─► devpi     ─► pypi.org                │    уже есть в Nexus? → пропуск
+  │           ─► squid     ─► прочее (только лог)     │    иначе POST /service/rest/v1/components
+  ├─ проходы установки (разведка + матрица)          ├─ исправление dist-tag latest (npm)
+  ├─ сбор файлов из хранилищ прокси                  └─ итоговый отчёт
+  ├─ манифест, отчёт, SHA256SUMS, подпись
+  ├─ docker compose down -v
+  └─ dist/<имя>-<время>.tar.gz ══════ перенос ══════►
+```
+
+## Компоненты
+
+Код — Python ≥ 3.12, только стандартная библиотека. Причина: `import` должен запускаться в офлайне без установки зависимостей. Проект управляется через uv, dev-зависимости: pytest, ruff.
+
+| Модуль | Назначение | Зависит от |
+|---|---|---|
+| `cli.py` | argparse, подкоманды `build` и `import` | все ниже |
+| `commands.py` | разбор команды пользователя в `InstallPlan` | — |
+| `platforms.py` | таблица платформ: флаги npm и uv для каждой | — |
+| `passes.py` | команды проходов установки из `InstallPlan` и платформ | `commands`, `platforms` |
+| `sandbox/` | `compose.yaml`, Dockerfile песочницы, devpi и squid, конфиги Verdaccio и squid (package data) | — |
+| `compose.py` | обёртка над `docker compose`: up, exec, копирование из контейнеров, down | docker |
+| `build.py` | сценарий сборки: стек, проходы, сбор, упаковка | `passes`, `compose`, `collect`, `bundle`, `signing` |
+| `collect.py` | извлечение файлов из хранилищ Verdaccio и devpi, разбор лога squid | `pkgmeta` |
+| `pkgmeta.py` | имя и версия из `.tgz` (`package/package.json`), из имени wheel и sdist | — |
+| `versions.py` | сравнение semver для dist-tag `latest` | — |
+| `bundle.py` | манифест, отчёт, `SHA256SUMS`, упаковка, безопасная распаковка | `pkgmeta` |
+| `signing.py` | подпись и проверка `SHA256SUMS` | `ssh-keygen` |
+| `nexus.py` | клиент Nexus: проверка наличия, загрузка, dist-tag | `urllib` |
+| `importer.py` | сценарий импорта | `bundle`, `signing`, `nexus`, `versions` |
+
+Каждый модуль тестируется отдельно. Docker нужен только `build.py`, Nexus — только `nexus.py`.
+
+## Разбор команды
+
+`commands.py` превращает команду в `InstallPlan`:
+
+```python
+@dataclass
+class InstallPlan:
+    ecosystem: Literal["npm", "pypi"] | None   # None — команда не распознана
+    specs: list[str]                            # спецификации пакетов
+    raw: list[str]                              # исходная команда
+```
+
+| Команда | ecosystem | specs |
+|---|---|---|
+| `npx [флаги] pkg[@ver] [args]` | npm | `pkg[@ver]` |
+| `npx -p a -p b cmd` | npm | `a`, `b` |
+| `npm exec --package=pkg -- ...` | npm | `pkg` |
+| `npm install\|i [-g] a b` | npm | `a`, `b` |
+| `uvx [--from X] [--with Y] cmd [args]` | pypi | `X` (или `cmd`), `Y` |
+| `uv tool install [--with Y] pkg` | pypi | `pkg`, `Y` |
+| `uv pip install a b` / `pip install a b` | pypi | `a`, `b` |
+
+Аргументы после имени запускаемой команды (`web` в `npx @deepseek-ai/dsh web`) отбрасываются: инструмент не запускается, только устанавливается. Флаги, требующие файлов (`-r`, `-e`, `-c`), в v1 дают понятную ошибку.
+
+## Платформы
+
+| Платформа | npm | uv |
+|---|---|---|
+| `linux-x64` | `--os=linux --cpu=x64` | `--python-platform x86_64-manylinux_2_28` |
+| `win-x64` | `--os=win32 --cpu=x64` | `--python-platform x86_64-pc-windows-msvc` |
+
+По умолчанию: `--platform linux-x64,win-x64 --python 3.12`. Несколько версий Python: `--python 3.11,3.12`.
+
+## Песочница
+
+Стек `docker compose` с именем проекта `offpack-<id>`. Он создаётся на каждую сборку, поэтому параллельные сборки не мешают друг другу.
+
+- Сеть `sandbox-net` с `internal: true`: из неё нет выхода в интернет.
+- Сеть `egress`: к ней подключены только прокси.
+- `sandbox` — образ на базе `node:24-bookworm-slim` с uv. Python 3.12 ставится при сборке образа (`uv python install 3.12`), пока у образа ещё есть сеть. Контейнер подключён только к `sandbox-net`. Переменные окружения:
+  - `npm_config_registry=http://verdaccio:4873/`
+  - `UV_DEFAULT_INDEX=http://devpi:3141/root/pypi/+simple/`, `PIP_INDEX_URL` — то же
+  - `HTTPS_PROXY`/`HTTP_PROXY=http://squid:3128`, `NO_PROXY=verdaccio,devpi`
+  - `UV_PYTHON_DOWNLOADS=never`
+  - кэши npm и uv во временной папке контейнера: при каждой сборке они пустые, поэтому всё идёт через прокси.
+- `verdaccio` — официальный образ `verdaccio/verdaccio:6`, uplink на npmjs, публикация запрещена.
+- `devpi` — собственный образ (`pip install devpi-server`, `devpi-init`), зеркало `root/pypi`.
+- `squid` — прямой прокси без расшифровки TLS. Всё разрешает и пишет хосты в `access.log`.
+- Хранилища — именованные volume. Файлы извлекаются через `docker compose cp`: это не зависит от uid на Linux-хосте.
+
+Ограничения контейнера `sandbox`: пользователь не root, `cap_drop: [ALL]`, `no-new-privileges`, лимиты памяти и CPU, общий таймаут сборки (`--timeout`, по умолчанию 900 с). Каталоги хоста и ключ подписи в песочницу не монтируются.
+
+## Проходы установки
+
+1. **Разведка** — платформа песочницы, установочные скрипты включены. Цель: увидеть в логе squid внешние загрузки из `postinstall`.
+   - npm: `npm install --no-save --prefix /tmp/p0 <specs>`
+   - pypi: `uv pip install --target /tmp/p0 <specs>`
+2. **Матрица** — для каждой платформы и каждой версии Python, скрипты выключены:
+   - npm: `npm install --no-save --ignore-scripts --os=.. --cpu=.. --prefix /tmp/<plat> <specs>` (от версии Python не зависит, выполняется один раз на платформу)
+   - pypi: `uv pip install --target /tmp/<plat>-<py> --python-platform .. --python-version <py> <specs>`
+3. **Нераспознанная команда** — выполняется как есть в разведывательном режиме. Матрица пропускается, в отчёт пишется предупреждение `unmapped_command`.
+
+Если любой проход падает, сборка завершается с ошибкой. Лог прохода сохраняется в `dist/<id>.log`, архив не создаётся.
+
+## Сбор файлов
+
+- **Verdaccio:** все `*.tgz` в storage. Имя и версия читаются из `package/package.json` внутри архива, а не из имени файла.
+- **devpi:** все файлы в `+files/root/pypi/+f/`. Имя и версия берутся из имени файла по спецификации wheel и sdist (`.whl`, `.tar.gz`, `.zip`). Имя нормализуется по PEP 503.
+- **squid:** уникальные хосты из `access.log`. Каждый хост становится предупреждением `egress`.
+- **sdist без wheel:** если для пары (пакет, версия) нет ни одного wheel под какую-то целевую платформу, пишется предупреждение `sdist_only`.
+
+## Формат архива
+
+```
+<имя>-<YYYYMMDD-HHMMSS>.tar.gz
+└── <имя>-<YYYYMMDD-HHMMSS>/
+    ├── manifest.json
+    ├── report.txt
+    ├── npm/<scope>__<name>-<version>.tgz
+    ├── pypi/<исходное имя файла>
+    ├── SHA256SUMS          # по всем файлам, включая manifest.json и report.txt
+    └── SHA256SUMS.sig      # ssh-keygen -Y sign, namespace "offpack"
+```
+
+Имя архива: первая спецификация без версии и scope, например `dsh` или `graphify`. Для нераспознанной команды — первое слово команды.
+
+```json
+{
+  "schema": 1,
+  "created_at": "2026-09-13T21:40:00Z",
+  "command": ["npx", "@deepseek-ai/dsh", "web"],
+  "platforms": ["linux-x64", "win-x64"],
+  "python_versions": ["3.12"],
+  "files": [
+    {"ecosystem": "npm", "name": "@deepseek-ai/dsh", "version": "1.2.3",
+     "path": "npm/deepseek-ai__dsh-1.2.3.tgz", "sha256": "…", "size": 12345}
+  ],
+  "warnings": [
+    {"kind": "egress", "detail": "github.com"},
+    {"kind": "sdist_only", "detail": "somepkg==0.1.0 (win-x64)"}
+  ]
+}
+```
+
+`report.txt` — то же в человекочитаемом виде: сколько файлов по экосистемам, общий размер, предупреждения. Оператор читает его перед переносом.
+
+## Подпись
+
+Используется `ssh-keygen -Y`: есть на Linux и в Windows 10+ из коробки, дополнительных зависимостей не нужно.
+
+- Онлайн: `offpack build --sign-key ~/.config/offpack/signing_key` (путь по умолчанию). Ключ ed25519 создаётся заранее командой `ssh-keygen -t ed25519`.
+- Офлайн: `offpack import --allowed-signers <файл>` (формат allowed_signers из OpenSSH, principal `offpack`).
+- Без ключа `build` завершается с ошибкой. Явный отказ от подписи: `--no-sign` в `build` и `--allow-unsigned` в `import`.
+
+## Импорт
+
+`offpack import <архив> --nexus http://nexus:8081 [--npm-repo npm-hosted] [--pypi-repo pypi-hosted] [--allowed-signers F] [--dry-run]`
+
+Учётные данные берутся из `NEXUS_USER` и `NEXUS_PASSWORD`.
+
+1. Распаковка во временную папку с `tarfile` и `filter="data"`: абсолютные пути, `..`, ссылки и спецфайлы отклоняются.
+2. Проверка подписи `SHA256SUMS`, затем sha256 каждого файла. Любое расхождение останавливает импорт, в Nexus ничего не загружается.
+3. Проверка, что каждый файл из `manifest.json` есть в `SHA256SUMS` и наоборот.
+4. Для каждого файла: проверка наличия в Nexus через протокольные эндпоинты самого репозитория. Для npm — packument `GET /repository/<repo>/<name>` (версия есть в `versions`), для PyPI — simple-индекс `GET /repository/<repo>/simple/<name>/` (имя файла есть в ссылках). Если файл есть, он пропускается. Иначе — `POST /service/rest/v1/components?repository=<repo>` с полем `npm.asset` или `pypi.asset`. Ответ 400 «does not allow updating» тоже считается пропуском.
+5. Для каждого npm-пакета после загрузки: чтение packument. Если `dist-tags.latest` меньше максимальной стабильной версии, выполняется `PUT /repository/<repo>/-/package/<name>/dist-tags/latest`. При неудаче — предупреждение, импорт не падает.
+6. Итог: загружено, пропущено, ошибки. Код выхода ненулевой, если была хотя бы одна ошибка загрузки.
+
+`--dry-run` выполняет шаги 1–4 без загрузки и показывает, что было бы загружено.
+
+Настройка клиентов в офлайне в зону ответственности offpack не входит, но описывается в README: group-репозитории `npm-all` и `pypi-all`, переменные `npm_config_registry` и `UV_DEFAULT_INDEX`, требование иметь на клиентах Node и Python.
+
+## Обработка ошибок
+
+| Ситуация | Поведение |
+|---|---|
+| Нет docker или compose | `build` сразу завершается с понятным сообщением |
+| Команда не распознана | Выполняется как есть, предупреждение `unmapped_command` |
+| Флаг, требующий файла (`-r`, `-e`) | Ошибка с пояснением, что это вне v1 |
+| Проход установки упал | Ошибка, лог сохраняется, архива нет, стек останавливается |
+| Таймаут | То же, что падение прохода |
+| Ctrl+C | Стек останавливается (`down -v`) в `finally` |
+| Не собрано ни одного файла | Ошибка: вероятно, песочница не ходила через прокси |
+| Подпись или хэш не совпали | `import` останавливается до любой загрузки |
+| Nexus недоступен или 401 | Ошибка до начала загрузок (проверка через `GET /service/rest/v1/status`) |
+
+## Безопасность
+
+- Чужой код выполняется только в разведывательном проходе, внутри контейнера без root и без capabilities. В контейнере нет секретов и каталогов хоста.
+- В матричных проходах npm-скрипты выключены (`--ignore-scripts`). Для PyPI сборка sdist (`setup.py`, PEP 517) в матричных проходах остаётся возможной: без неё не разрешить зависимости пакетов без wheel. Выполняется в той же песочнице.
+- Выход в интернет из песочницы идёт только через прокси. Все хосты вне реестров попадают в отчёт.
+- Ключ подписи хранится только на онлайн-хосте и в песочницу не передаётся.
+- `import` не выполняет код из архива, распаковка защищена от path traversal.
+- Сканирование уязвимостей в v1 не входит. Решение о переносе оператор принимает по `report.txt`.
+
+## Тестирование
+
+- **Unit (без docker и сети):** разбор команд по таблице выше, таблица платформ, разбор имён wheel и sdist, чтение `package.json` из `.tgz`, сборка манифеста и `SHA256SUMS`, отклонение опасных tar, подпись и проверка через `ssh-keygen` на временном ключе, выбор максимальной semver-версии, клиент Nexus против фейкового HTTP-сервера (`http.server` в потоке).
+- **Интеграционные (маркер `docker`):**
+  - `npx esbuild --version`: в архиве должны быть `@esbuild/linux-x64` и `@esbuild/win32-x64`.
+  - `uv tool install ruff`: в архиве должны быть wheel `manylinux…x86_64` и `win_amd64`.
+- **E2E (маркер `nexus`, запускается вручную):** контейнер `sonatype/nexus3`, создание hosted-репо через API, импорт архива, затем установка из Nexus в контейнере без сети.
+
+## Риски и что проверить на реальном стенде
+
+- Поддержка dist-tag API в hosted npm-репо зависит от версии Nexus. Если API нет, остаётся предупреждение.
+- Совместимость uv с devpi (PEP 691 JSON, PEP 658 metadata). При проблемах запасной вариант — `pip download` вместо `uv pip install` в матричных проходах.
+- Формат ответа Nexus на повторную загрузку (400 «does not allow updating») при `writePolicy: allow_once`. Проверяется e2e-тестом.
+- Образ `sonatype/nexus3` на arm64 (машина разработки — Apple Silicon): при отсутствии e2e запускается с `platform: linux/amd64` через эмуляцию.
