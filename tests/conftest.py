@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fake_nexus import FakeNexus
+
 
 def create_signing_key(directory: Path) -> tuple[Path, Path]:
     """Ключ ed25519 без пароля и allowed_signers с principal offpack."""
@@ -21,3 +23,9 @@ def create_signing_key(directory: Path) -> tuple[Path, Path]:
 @pytest.fixture
 def signing_key(tmp_path) -> tuple[Path, Path]:
     return create_signing_key(tmp_path / "keys")
+
+
+@pytest.fixture
+def fake_nexus():
+    with FakeNexus() as nexus:
+        yield nexus
