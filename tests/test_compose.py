@@ -65,6 +65,14 @@ def test_wait_ready_times_out(tmp_path):
         Compose("p", tmp_path, runner=runner).wait_ready(timeout=0, interval=0)
 
 
+def test_wait_ready_treats_probe_timeout_as_not_ready(tmp_path):
+    def runner(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 30)
+
+    with pytest.raises(ComposeError, match="не поднялись"):
+        Compose("p", tmp_path, runner=runner).wait_ready(timeout=0, interval=0)
+
+
 def test_ensure_docker(tmp_path):
     ensure_docker(Recorder())
     with pytest.raises(ComposeError):

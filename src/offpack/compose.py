@@ -79,7 +79,10 @@ class Compose:
         pending = dict(READY_PROBES)
         while True:
             for name, url in list(pending.items()):
-                probe = self.exec("sandbox", ["node", "-e", _FETCH_PROBE, url], timeout=30)
+                try:
+                    probe = self.exec("sandbox", ["node", "-e", _FETCH_PROBE, url], timeout=30)
+                except subprocess.TimeoutExpired:
+                    continue
                 if probe.returncode == 0:
                     del pending[name]
             if not pending:
