@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 
 from offpack import cli
+from offpack.bundle import SUMS, pack_bundle, stage_bundle
 from offpack.cli import main
-from tests.test_importer import make_archive
+from offpack.errors import OffpackError
+from offpack.pkgmeta import PackageFile
+from offpack.signing import sign_file
+from tests.helpers import make_npm_tgz
+from tests.test_importer import META, make_archive
 
 
 def test_version(capsys):
@@ -123,3 +128,42 @@ def test_import_requires_trust(tmp_path, signing_key, fake_nexus, monkeypatch, c
     code = main(["import", str(make_archive(tmp_path, key)), "--nexus", fake_nexus.url])
     assert code == 2
     assert "--allowed-signers" in capsys.readouterr().err
+
+
+def test_import_output_is_escaped(tmp_path, signing_key, fake_nexus, monkeypatch, capsys):
+    """Имена из манифеста (подписанного, но собранного из чужих tarball) не управляют терминалом."""
+    key, allowed = signing_key
+    tgz = make_npm_tgz(tmp_path / "src", "demo", "1.0.0")
+    evil = PackageFile("npm", "demo\x1b[8m", "1.0.0\x1b]0;x\x07", tgz, "demo-1.0.0.tgz")
+    bundle_dir = stage_bundle(tmp_path / "stage", "evil-20260913-000000", [evil], META, [])
+    sign_file(bundle_dir / SUMS, key)
+    archive = pack_bundle(bundle_dir, tmp_path / "out")
+    monkeypatch.setenv("NEXUS_USER", "admin")
+    monkeypatch.setenv("NEXUS_PASSWORD", "secret")
+    code = main(["import", str(archive), "--nexus", fake_nexus.url, "--allowed-signers", str(allowed)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "\x1b" not in out and "\x07" not in out
+    assert "demo\\x1b[8m==1.0.0\\x1b]0;x\\x07" in out
+    assert out.endswith("\n")
+
+
+def test_error_message_is_escaped(monkeypatch, capsys):
+    def fail(opts):
+        raise OffpackError("docker: плохо \x1b[2J\nвторая строка \x9b31m")
+
+    monkeypatch.setattr(cli, "run_build", fail)
+    assert main(["build", "--no-sign", "--", "npx", "cowsay"]) == 2
+    err = capsys.readouterr().err
+    assert "\x1b" not in err and "\x9b" not in err
+    assert err == "offpack: ошибка: docker: плохо \\x1b[2J\nвторая строка \\x9b31m\n"
+
+
+def test_os_error_message_is_escaped(monkeypatch, capsys):
+    def fail(opts):
+        raise PermissionError(13, "Permission denied \x1b[8m")
+
+    monkeypatch.setattr(cli, "run_build", fail)
+    assert main(["build", "--no-sign", "--", "npx", "cowsay"]) == 2
+    err = capsys.readouterr().err
+    assert "\x1b" not in err and "\\x1b" in err

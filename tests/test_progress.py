@@ -10,6 +10,7 @@ from offpack.progress import (
     parse_devpi_line,
     parse_verdaccio_line,
     sanitize,
+    sanitize_text,
 )
 
 # Настоящие строки Verdaccio 6.10.3 (log: {format: pretty, level: http}).
@@ -257,3 +258,8 @@ def test_message_has_timer():
     clock.now = 3700
     progress.message("npm 1 файлов 1 Б")
     assert lines == ["[60:00] npm 1 файлов 1 Б"]
+
+
+def test_sanitize_text_keeps_newlines():
+    assert sanitize_text("отчёт\n  pkg\x1b[8m==1\r\n\n") == "отчёт\n  pkg\\x1b[8m==1\\r\n\n"
+    assert sanitize_text("") == ""

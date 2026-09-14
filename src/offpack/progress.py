@@ -78,11 +78,16 @@ def sanitize(text: str) -> str:
     """Экранировать непечатаемые символы (ESC, прочие C0, DEL, C1, bidi и т. п.).
 
     Всё, что уходит в терминал оператора, может содержать данные из песочницы.
-    Перевод строки сохраняется только в многострочных блоках (см. Progress.block).
+    Перевод строки сохраняется только в многострочном тексте (см. sanitize_text).
     """
     if text.isprintable():
         return text
     return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in text)
+
+
+def sanitize_text(text: str) -> str:
+    """Многострочный текст: строки экранируются по отдельности, переводы строк сохраняются."""
+    return "\n".join(sanitize(line) for line in text.split("\n"))
 
 
 def format_duration(seconds: float) -> str:
@@ -196,7 +201,7 @@ class Progress:
     def block(self, text: str) -> None:
         """Многострочный текст (отчёт) одним выводом; строки экранируются по отдельности."""
         with self._lock:
-            self._write("\n".join(sanitize(line) for line in text.split("\n")))
+            self._write(sanitize_text(text))
 
     def output(self, line: str) -> None:
         """Строка вывода инструмента (режим -v)."""

@@ -13,6 +13,12 @@ from offpack.errors import OffpackError
 
 _SDIST_EXTS = (".tar.gz", ".zip", ".tar.bz2")
 _PACKAGE_JSON = re.compile(r"^[^/]+/package\.json$")
+# Имя и версия npm из package.json внутри tarball не сверяются с метаданными реестра
+# (manifest confusion) и попадают в манифест и в терминал оператора: только безопасный
+# набор символов. Заглавные буквы допустимы (старые пакеты вроде JSONStream).
+_NPM_NAME = re.compile(r"(?:@[A-Za-z0-9._~-]+/)?[A-Za-z0-9~-][A-Za-z0-9._~-]*")
+_NPM_NAME_MAX = 214
+_NPM_VERSION = re.compile(r"[0-9][0-9A-Za-z.+-]{0,255}")
 
 
 class PackageMetaError(OffpackError):
@@ -58,6 +64,10 @@ def read_npm_tarball(path: Path) -> tuple[str, str]:
     name, version = data.get("name"), data.get("version")
     if not isinstance(name, str) or not isinstance(version, str):
         raise PackageMetaError(f"{path.name}: в package.json нет name или version")
+    if len(name) > _NPM_NAME_MAX or not _NPM_NAME.fullmatch(name):
+        raise PackageMetaError(f"{path.name}: недопустимое имя npm-пакета {name!r}")
+    if not _NPM_VERSION.fullmatch(version):
+        raise PackageMetaError(f"{path.name}: недопустимая версия npm-пакета {version!r}")
     return name, version
 
 

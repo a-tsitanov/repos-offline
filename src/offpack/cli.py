@@ -19,6 +19,7 @@ from offpack.platforms import (
     parse_platforms,
     parse_python_versions,
 )
+from offpack.progress import sanitize_text
 
 
 def default_sign_key() -> Path:
@@ -148,7 +149,8 @@ def _cmd_import(args: argparse.Namespace) -> int:
         ),
         client,
     )
-    print(report.render(dry_run=args.dry_run), end="")
+    # имена и версии из манифеста и ответы Nexus — чужие данные: экранируем
+    print(sanitize_text(report.render(dry_run=args.dry_run)), end="")
     return 0 if report.ok else 1
 
 
@@ -162,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return func(args)
     except (OffpackError, OSError) as exc:
-        print(f"offpack: ошибка: {exc}", file=sys.stderr)
+        # в тексте бывают имена файлов, stderr docker и ответы Nexus
+        print(f"offpack: ошибка: {sanitize_text(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("offpack: прервано", file=sys.stderr)

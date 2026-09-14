@@ -91,3 +91,71 @@ def test_read_npm_tarball_with_invalid_utf8(tmp_path):
 
 def test_normalize_pypi_name():
     assert normalize_pypi_name("Foo__Bar.baz") == "foo-bar-baz"
+
+
+@pytest.mark.parametrize(
+    ("name", "version"),
+    [
+        ("cowsay", "1.5.0"),
+        ("@esbuild/win32-x64", "0.23.0"),
+        ("@deepseek-ai/dsh", "0.1.5-rc.1"),
+        ("JSONStream", "1.0.0+build.5"),
+        ("lodash.merge", "4.6.2"),
+        ("@types/node~x", "22.0.0-beta.1+sha.abc"),
+        ("a" * 214, "1"),
+    ],
+)
+def test_read_npm_tarball_accepts_valid_name_and_version(tmp_path, name, version):
+    path = make_npm_tgz(tmp_path, name, version)
+    assert read_npm_tarball(path) == (name, version)
+
+
+def _npm_tgz_with(tmp_path, name, version):
+    """Tarball с произвольным package.json (make_npm_tgz строит имя файла из name)."""
+    path = tmp_path / "pkg.tgz"
+    payload = json.dumps({"name": name, "version": version}).encode()
+    with tarfile.open(path, "w:gz") as archive:
+        info = tarfile.TarInfo("package/package.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    return path
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "evil\x1b[8m",
+        "@scope\x1b[2J/pkg",
+        "@scope/pkg\x9b31m",
+        "bidi\u202epkg",
+        "",
+        "has space",
+        "tab\tname",
+        "new\nline",
+        ".hidden",
+        "_under",
+        "@scope/.hidden",
+        "@scope/_under",
+        "@scope",
+        "@/pkg",
+        "@scope/",
+        "scope/pkg",
+        "@a/b/c",
+        "a" * 215,
+        "имя",
+    ],
+)
+def test_read_npm_tarball_rejects_invalid_name(tmp_path, name):
+    with pytest.raises(PackageMetaError) as exc:
+        read_npm_tarball(_npm_tgz_with(tmp_path, name, "1.0.0"))
+    assert str(exc.value).isprintable()
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["", "1 0", "1.0.0\x1b[8m", "v1.0.0", "-1", ".1", "1.0.0\n", "1/0", "1" * 257],
+)
+def test_read_npm_tarball_rejects_invalid_version(tmp_path, version):
+    with pytest.raises(PackageMetaError) as exc:
+        read_npm_tarball(_npm_tgz_with(tmp_path, "demo", version))
+    assert str(exc.value).isprintable()
