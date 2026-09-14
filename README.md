@@ -83,6 +83,7 @@ Windows (PowerShell):
 npm config set registry http://nexus:8081/repository/npm-all/
 [Environment]::SetEnvironmentVariable("UV_DEFAULT_INDEX", "http://nexus:8081/repository/pypi-all/simple", "User")
 [Environment]::SetEnvironmentVariable("PIP_INDEX_URL", "http://nexus:8081/repository/pypi-all/simple", "User")
+[Environment]::SetEnvironmentVariable("PIP_TRUSTED_HOST", "nexus", "User")
 [Environment]::SetEnvironmentVariable("UV_PYTHON_DOWNLOADS", "never", "User")
 ```
 
