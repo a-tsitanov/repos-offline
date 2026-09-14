@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -53,7 +55,11 @@ def ensure_docker(runner: Runner = subprocess.run) -> None:
 
 
 def _start_lines(popen: Popen, argv: list[str]) -> subprocess.Popen:
-    """Процесс с объединёнными stdout и stderr, читаемыми построчно."""
+    """Процесс с объединёнными stdout и stderr, читаемыми построчно.
+
+    Своя сессия (и группа процессов): при остановке сигнал получает вся группа, и
+    потомок, унаследовавший stdout, не держит pipe открытым после дедлайна.
+    """
     return popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -63,32 +69,62 @@ def _start_lines(popen: Popen, argv: list[str]) -> subprocess.Popen:
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        start_new_session=True,
     )
 
 
+def _signal_group(process: subprocess.Popen, *, force: bool) -> None:
+    """SIGKILL (force) или SIGTERM группе процесса; без killpg (Windows) — только ему."""
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass  # группы уже нет
+    elif process.poll() is None:
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+
+
 class LogFollower:
-    """Фоновое чтение `docker compose logs -f`: каждая строка передаётся в on_line."""
+    """Фоновое чтение `docker compose logs -f`: каждая строка передаётся в on_line.
+
+    Исключение обработчика не останавливает чтение (иначе pipe переполнится):
+    первое сохраняется в `error`.
+    """
 
     def __init__(self, process: subprocess.Popen, on_line: LineHandler) -> None:
         self._process = process
         self._on_line = on_line
+        self._stopped = False
+        self.error: Exception | None = None
         self._thread = threading.Thread(target=self._pump, name="offpack-logs", daemon=True)
         self._thread.start()
 
     def _pump(self) -> None:
         assert self._process.stdout is not None
         for line in self._process.stdout:
-            self._on_line(line.rstrip("\r\n"))
+            try:
+                self._on_line(line.rstrip("\r\n"))
+            except Exception as exc:
+                if self.error is None:
+                    self.error = exc
 
     def stop(self, timeout: float = 5.0) -> None:
-        if self._process.poll() is None:
-            self._process.terminate()
+        if self._stopped:
+            return
+        self._stopped = True
+        _signal_group(self._process, force=False)
         try:
             self._process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            self._process.kill()
+            _signal_group(self._process, force=True)
             self._process.wait()
-        self._thread.join(timeout=timeout)
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():  # потомок не завершился по SIGTERM и держит pipe
+            _signal_group(self._process, force=True)
+            self._thread.join(timeout=timeout)
         if self._process.stdout is not None and not self._thread.is_alive():
             self._process.stdout.close()
 
@@ -145,12 +181,17 @@ class Compose:
         """
         process = _start_lines(self._popen, [*self._base(), "exec", "-T", service, *argv])
         expired = threading.Event()
+        state_lock = threading.Lock()
+        finished = False
 
-        def kill() -> None:
-            expired.set()
-            process.kill()
+        def on_timeout() -> None:
+            with state_lock:
+                if finished:  # процесс уже завершился сам: это не таймаут
+                    return
+                expired.set()
+            _signal_group(process, force=True)
 
-        timer = threading.Timer(timeout, kill) if timeout is not None else None
+        timer = threading.Timer(timeout, on_timeout) if timeout is not None else None
         if timer is not None:
             timer.daemon = True
             timer.start()
@@ -161,22 +202,23 @@ class Compose:
                     on_line(line.rstrip("\r\n"))
             code = process.wait()
         except BaseException:
-            process.kill()
+            _signal_group(process, force=True)
             process.wait()
             raise
         finally:
+            with state_lock:
+                finished = True
             if timer is not None:
                 timer.cancel()
-        # процесс мог завершиться сам в момент срабатывания таймера: тогда код не от kill
-        if expired.is_set() and code != 0:
+        if expired.is_set():
             raise subprocess.TimeoutExpired(list(argv), timeout or 0)
         return code
 
-    def follow_logs(self, services: Sequence[str], on_line: LineHandler) -> LogFollower:
-        """Следить за логами сервисов в фоне; остановить — LogFollower.stop()."""
+    def follow_logs(self, service: str, on_line: LineHandler) -> LogFollower:
+        """Следить за логом одного сервиса в фоне; остановить — LogFollower.stop()."""
         process = _start_lines(
             self._popen,
-            [*self._base(), "logs", "-f", "--no-color", "--no-log-prefix", *services],
+            [*self._base(), "logs", "-f", "--no-color", "--no-log-prefix", service],
         )
         return LogFollower(process, on_line)
 

@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -26,15 +27,20 @@ from offpack.bundle import (
 )
 from offpack.collect import collect_npm, collect_pypi, parse_egress_log, sdist_only_notices
 from offpack.commands import parse_command
-from offpack.compose import Compose, ensure_docker, sandbox_assets
+from offpack.compose import Compose, LogFollower, ensure_docker, sandbox_assets
 from offpack.errors import OffpackError
 from offpack.passes import Pass, plan_passes
 from offpack.platforms import Platform
-from offpack.progress import Progress, format_duration, format_summary, parse_proxy_line
+from offpack.progress import (
+    LOG_PARSERS,
+    DownloadEvent,
+    Progress,
+    format_duration,
+    format_summary,
+)
 from offpack.signing import sign_file
 
 READY_TIMEOUT = 180.0
-PROXY_SERVICES = ("verdaccio", "devpi")
 # Пауза перед итогом прохода: последние строки логов прокси доходят через docker с задержкой.
 PROXY_LOG_SETTLE = 0.3
 
@@ -92,11 +98,14 @@ def run_build(
                 compose.up()
             with progress.stage("жду готовности verdaccio, devpi, squid", done="сервисы готовы"):
                 compose.wait_ready(timeout=min(READY_TIMEOUT, _remaining(deadline)))
-            follower = compose.follow_logs(PROXY_SERVICES, partial(_on_proxy_line, progress))
-            try:
+            with ExitStack() as followers:
+                # по процессу на сервис: строка разбирается только парсером своего сервиса
+                for service, parser in LOG_PARSERS.items():
+                    follower = compose.follow_logs(
+                        service, partial(_on_proxy_line, progress, parser)
+                    )
+                    followers.callback(_stop_follower, follower, service, progress)
                 _run_passes(compose, passes, deadline, log_path, progress, opts.verbose)
-            finally:
-                follower.stop()
             with progress.stage("копирую файлы из хранилищ прокси", done="файлы собраны"):
                 compose.stop()
                 compose.copy_out("verdaccio", "/verdaccio/storage/data", work / "npm")
@@ -136,7 +145,7 @@ def run_build(
             archive = pack_bundle(bundle_dir, opts.out_dir)
         manifest = Manifest.from_json((bundle_dir / MANIFEST).read_text(encoding="utf-8"))
         progress.message(format_summary(_stats(manifest), len(manifest.warnings)))
-        log((bundle_dir / REPORT).read_text(encoding="utf-8"))
+        progress.block((bundle_dir / REPORT).read_text(encoding="utf-8"))
     return archive
 
 
@@ -170,10 +179,20 @@ def _stats(manifest: Manifest) -> dict[str, tuple[int, int]]:
     return stats
 
 
-def _on_proxy_line(progress: Progress, line: str) -> None:
-    event = parse_proxy_line(line)
+def _on_proxy_line(
+    progress: Progress, parser: Callable[[str], DownloadEvent | None], line: str
+) -> None:
+    event = parser(line)
     if event is not None:
         progress.download(event)
+
+
+def _stop_follower(follower: LogFollower, service: str, progress: Progress) -> None:
+    follower.stop()
+    if follower.error is not None:
+        progress.message(
+            f"предупреждение: список загрузок неполный (лог {service}): {follower.error}"
+        )
 
 
 def _remaining(deadline: float) -> float:

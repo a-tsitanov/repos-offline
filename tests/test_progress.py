@@ -8,8 +8,8 @@ from offpack.progress import (
     format_size,
     format_summary,
     parse_devpi_line,
-    parse_proxy_line,
     parse_verdaccio_line,
+    sanitize,
 )
 
 # Настоящие строки Verdaccio 6.10.3 (log: {format: pretty, level: http}).
@@ -37,22 +37,28 @@ VERDACCIO_IGNORED = [
     "warn --- http address - http://0.0.0.0:4873/ - verdaccio/6.10.3",
 ]
 
-# Настоящие строки devpi-server 6.20.3 (уровень INFO по умолчанию), с префиксом
-# docker compose logs. Размер файла в логе не пишется.
+# Настоящие строки devpi-server 6.20.3 (уровень INFO по умолчанию), как их отдаёт
+# docker compose logs --no-log-prefix devpi. Размер файла в логе не пишется.
 DEVPI_WHL = (
-    "devpi-1  | 2026-09-14 08:49:44,127 INFO  [req10] GET "
+    "2026-09-14 08:49:44,127 INFO  [req10] GET "
     "/root/pypi/+f/815/e7be7a7806d54/idna-3.19-py3-none-any.whl"
 )
 DEVPI_IGNORED = [
-    "devpi-1  | 2026-09-14 08:49:39,315 INFO  [req2] HEAD /root/pypi/+f/4c1/96c968874fc80/"
+    "2026-09-14 08:49:39,315 INFO  [req2] HEAD /root/pypi/+f/4c1/96c968874fc80/"
     "ruff-0.16.7-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
-    "devpi-1  | 2026-09-14 08:49:34,093 INFO  [req0] GET /root/pypi/+simple/ruff/",
-    "devpi-1  | 2026-09-14 08:49:39,776 INFO  [req2] [Rtx1] reading remote: URL('https://files."
+    "2026-09-14 08:49:34,093 INFO  [req0] GET /root/pypi/+simple/ruff/",
+    "2026-09-14 08:49:39,776 INFO  [req2] [Rtx1] reading remote: URL('https://files."
     "pythonhosted.org/packages/eb/2d/db16/ruff-0.16.7-py3-none-any.whl'), target root/pypi/+f/4c1/"
     "96c968874fc80/ruff-0.16.7-py3-none-any.whl",
-    "devpi-1  | 2026-09-14 08:49:43,737 INFO  Client disconnected while serving /root/pypi/+f/4c1/"
+    "2026-09-14 08:49:43,737 INFO  Client disconnected while serving /root/pypi/+f/4c1/"
     "96c968874fc80/ruff-0.16.7-py3-none-any.whl",
-    "devpi-1  | 2026-09-14 08:49:44,125 INFO  [Wtx3] fswriter4: committed at 4",
+    "2026-09-14 08:49:44,125 INFO  [Wtx3] fswriter4: committed at 4",
+    # строка Verdaccio с путём devpi внутри не должна становиться PyPI-событием
+    "info <-- 172.19.0.5 requested 'GET /x] GET /root/pypi/+f/a/b/fake.whl'",
+    "http <-- 404, user: null(172.19.0.5), req: 'GET /x] GET /root/pypi/+f/a/b/fake.whl', bytes: 0/9",
+    # чужой индекс и хвост после пути
+    "2026-09-14 08:49:44,127 INFO  [req10] GET /evil/idx/+f/815/e7/x-1-py3-none-any.whl",
+    "2026-09-14 08:49:44,127 INFO  [req10] GET /root/pypi/+f/815/e7/x.whl trailing",
 ]
 
 
@@ -64,12 +70,25 @@ def test_verdaccio_scoped_tarball():
     assert parse_verdaccio_line(VERDACCIO_SCOPED_TGZ) == DownloadEvent("npm", "@esbuild/win32-x64 0.28.2", 4829680)
 
 
-def test_verdaccio_encoded_scope_and_prefix():
+def test_verdaccio_encoded_scope():
     line = (
-        "verdaccio-1  | http <-- 200, user: null(172.19.0.5), "
+        "http <-- 200, user: null(172.19.0.5), "
         "req: 'GET /@types%2fnode/-/node-22.1.0.tgz?x=1', bytes: 0/100"
     )
     assert parse_verdaccio_line(line) == DownloadEvent("npm", "@types/node 22.1.0", 100)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # поддельный хвост внутри URL: строка должна совпадать с форматом целиком
+        "http <-- 200, user: null(1.2.3.4), req: 'GET /a/-/a-1.tgz', bytes: 0/5' x', bytes: 0/9",
+        "xx http <-- 200, user: null(1.2.3.4), req: 'GET /a/-/a-1.tgz', bytes: 0/5",
+        "2026-09-14 08:49:44,127 INFO  [req10] GET /root/pypi/+f/815/e7/a/-/a-1.tgz",
+    ],
+)
+def test_verdaccio_requires_full_line_format(line):
+    assert parse_verdaccio_line(line) is None
 
 
 @pytest.mark.parametrize("line", VERDACCIO_IGNORED)
@@ -86,10 +105,28 @@ def test_devpi_ignores_non_downloads(line):
     assert parse_devpi_line(line) is None
 
 
-def test_parse_proxy_line_dispatches():
-    assert parse_proxy_line(VERDACCIO_TGZ).ecosystem == "npm"
-    assert parse_proxy_line(DEVPI_WHL).ecosystem == "pypi"
-    assert parse_proxy_line("garbage") is None
+def test_devpi_encoded_control_characters_are_decoded_then_escaped_on_output():
+    line = "2026-09-14 08:49:44,127 INFO  [req11] GET /root/pypi/+f/0/0/%1b%5b8m"
+    event = parse_devpi_line(line)
+    assert event == DownloadEvent("pypi", "\x1b[8m", None)
+    progress, lines, _ = _progress()
+    progress.download(event)
+    assert lines == ["        ↓ pypi \\x1b[8m"]
+    assert "\x1b" not in lines[0]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("обычный текст ✓ ↓ · │", "обычный текст ✓ ↓ · │"),
+        ("\x1b[2J\x07", "\\x1b[2J\\x07"),
+        ("a\rb\tc\x00", "a\\rb\\tc\\x00"),
+        ("\x7f\x9b31m", "\\x7f\\x9b31m"),
+        ("bidi\u202eoverride", "bidi\\u202eoverride"),
+    ],
+)
+def test_sanitize_escapes_non_printable(text, expected):
+    assert sanitize(text) == expected
 
 
 @pytest.mark.parametrize(
@@ -194,6 +231,25 @@ def test_output_line_is_indented():
     progress.output("Progress: resolved 1, reused 0, downloaded 0, added 0")
     progress.output("")
     assert lines == ["          Progress: resolved 1, reused 0, downloaded 0, added 0", ""]
+
+
+def test_verbose_output_escapes_raw_escape_sequences():
+    progress, lines, _ = _progress()
+    progress.output("postinstall: \x1b]0;owned\x07\x1b[31mred")
+    assert lines == ["          postinstall: \\x1b]0;owned\\x07\\x1b[31mred"]
+
+
+def test_all_terminal_lines_are_escaped():
+    progress, lines, _ = _progress()
+    with progress.stage("этап \x1b[1m", done="готово \x1b[1m"):
+        pass
+    progress.pass_started("npm", "pnpm add \x1b[5m")
+    progress.pass_finished("npm")
+    progress.pass_failed("npm", "код 1", "dist/\x1bx.log")
+    progress.message("итог \x9b")
+    progress.block("отчёт\n  pkg\x1b[8m==1\n")
+    assert not any(ch in "".join(lines) for ch in "\x1b\x9b")
+    assert lines[-1] == "отчёт\n  pkg\\x1b[8m==1\n"
 
 
 def test_message_has_timer():

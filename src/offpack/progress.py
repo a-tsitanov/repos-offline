@@ -13,16 +13,23 @@ from urllib.parse import unquote, urlsplit
 INDENT = " " * 8
 ECOSYSTEMS = ("npm", "pypi")
 
+# Строки логов — данные из песочницы: код в ней управляет путями запросов к прокси.
+# Поэтому каждая строка разбирается только парсером своего сервиса и должна совпасть
+# с форматом целиком, а всё, что печатается в терминал, проходит через sanitize().
+
 # Verdaccio 6, format pretty, level http. Каждый запрос логируется по событию close
 # (обычно bytes 0/0) и по res.end (итоговый размер ответа): считаем только строки
 # с ненулевым размером.
 _VERDACCIO_REQUEST = re.compile(
-    r"http <-- (?P<status>\d{3}), user: .*?, req: '(?P<method>[A-Z]+) (?P<url>[^' ]+)',"
+    r"http <-- (?P<status>\d{3}), user: [^,]*, req: '(?P<method>[A-Z]+) (?P<url>[^' ]+)',"
     r" bytes: \d+/(?P<out>\d+)"
 )
 _NPM_TARBALL = re.compile(r"/(?P<name>@[^/]+/[^/]+|[^@/][^/]*)/-/(?P<file>[^/]+)\.tgz")
-# devpi-server: «[reqN] GET /<user>/<index>/+f/<hash>/<hash>/<файл>» в начале запроса.
-_DEVPI_FILE_GET = re.compile(r"\] GET (?P<path>/\S*/\+f/\S+)\s*$")
+# devpi-server 6: «2026-09-14 08:49:44,127 INFO  [req10] GET /root/pypi/+f/<h>/<h>/<файл>».
+# Пишется в начале запроса, до ответа: это запрос, а не подтверждённая загрузка.
+_DEVPI_FILE_GET = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} INFO +\[req\d+\] GET (?P<path>/root/pypi/\+f/\S+)"
+)
 
 
 @dataclass(frozen=True)
@@ -34,7 +41,7 @@ class DownloadEvent:
 
 def parse_verdaccio_line(line: str) -> DownloadEvent | None:
     """Скачивание tarball через Verdaccio; метаданные (packument) не считаются."""
-    match = _VERDACCIO_REQUEST.search(line)
+    match = _VERDACCIO_REQUEST.fullmatch(line)
     if not match or match["method"] != "GET" or match["status"] != "200":
         return None
     size = int(match["out"])
@@ -50,8 +57,8 @@ def parse_verdaccio_line(line: str) -> DownloadEvent | None:
 
 
 def parse_devpi_line(line: str) -> DownloadEvent | None:
-    """Скачивание файла зеркала devpi (+f); simple-страницы и HEAD не считаются."""
-    match = _DEVPI_FILE_GET.search(line)
+    """Запрос файла зеркала root/pypi (+f); simple-страницы и HEAD не считаются."""
+    match = _DEVPI_FILE_GET.fullmatch(line)
     if not match:
         return None
     filename = unquote(urlsplit(match["path"]).path).rsplit("/", 1)[-1]
@@ -60,8 +67,22 @@ def parse_devpi_line(line: str) -> DownloadEvent | None:
     return DownloadEvent("pypi", filename, None)
 
 
-def parse_proxy_line(line: str) -> DownloadEvent | None:
-    return parse_verdaccio_line(line) or parse_devpi_line(line)
+# сервис стека → парсер его лога
+LOG_PARSERS: dict[str, Callable[[str], DownloadEvent | None]] = {
+    "verdaccio": parse_verdaccio_line,
+    "devpi": parse_devpi_line,
+}
+
+
+def sanitize(text: str) -> str:
+    """Экранировать непечатаемые символы (ESC, прочие C0, DEL, C1, bidi и т. п.).
+
+    Всё, что уходит в терминал оператора, может содержать данные из песочницы.
+    Перевод строки сохраняется только в многострочных блоках (см. Progress.block).
+    """
+    if text.isprintable():
+        return text
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in text)
 
 
 def format_duration(seconds: float) -> str:
@@ -119,8 +140,9 @@ class Progress:
         self._bytes = 0
 
     def _line(self, text: str) -> None:
+        """Единственная точка вывода в терминал: всё экранируется здесь."""
         with self._lock:
-            self._write(text)
+            self._write(sanitize(text))
 
     def _stamp(self) -> str:
         minutes, seconds = divmod(max(int(self._clock() - self._started), 0), 60)
@@ -153,7 +175,7 @@ class Progress:
             self._seen.add(key)
             self._count += 1
             self._bytes += event.size or 0
-            self._write(format_download(event))
+            self._line(format_download(event))
 
     def _take_pass(self) -> tuple[int, int, str]:
         count, size = self._count, self._bytes
@@ -170,6 +192,11 @@ class Progress:
         with self._lock:
             _, _, duration = self._take_pass()
             self.message(f"✗ {name}: {reason} ({duration}), лог: {log_path}")
+
+    def block(self, text: str) -> None:
+        """Многострочный текст (отчёт) одним выводом; строки экранируются по отдельности."""
+        with self._lock:
+            self._write("\n".join(sanitize(line) for line in text.split("\n")))
 
     def output(self, line: str) -> None:
         """Строка вывода инструмента (режим -v)."""

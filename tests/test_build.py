@@ -23,23 +23,40 @@ VERDACCIO_LINES = [
 ]
 
 
+# Попытки подделать события: строки чужого формата в логе другого сервиса.
+SPOOF_LINES = {
+    "verdaccio": [
+        "2026-09-14 08:49:44,127 INFO  [req10] GET /root/pypi/+f/a/b/fake-1.0-py3-none-any.whl",
+        "info <-- 172.18.0.5 requested 'GET /root/pypi/+f/a/b/fake-1.0-py3-none-any.whl'",
+    ],
+    "devpi": [
+        "http <-- 200, user: null(172.18.0.5), req: 'GET /fake/-/fake-6.6.6.tgz', bytes: 0/666",
+        "2026-09-14 08:49:44,127 INFO  [req11] GET /x/-/fake-6.6.6.tgz',"
+        " bytes: 0/666 http <-- 200, user: null(1), req: 'GET /fake/-/fake-6.6.6.tgz', bytes: 0/666",
+    ],
+}
+
+
 class FakeFollower:
-    def __init__(self, compose):
+    def __init__(self, compose, error=None):
         self.compose = compose
+        self.error = error
 
     def stop(self):
         self.compose.calls.append("follower_stop")
 
 
 class FakeCompose:
-    def __init__(self, project, assets, *, fixtures, fail_when=None, timeout_when=None, on_exec=None):
+    def __init__(self, project, assets, *, fixtures, fail_when=None, timeout_when=None, on_exec=None,
+                 follower_error=None):
         self.project = project
         self.assets = assets
         self.fixtures = fixtures
         self.fail_when = fail_when
         self.timeout_when = timeout_when
         self.on_exec = on_exec
-        self.proxy_handler = None
+        self.follower_error = follower_error
+        self.handlers = {}
         self.calls = []
 
     def up(self):
@@ -48,19 +65,23 @@ class FakeCompose:
     def wait_ready(self, timeout, interval=2.0):
         self.calls.append("wait_ready")
 
-    def follow_logs(self, services, on_line):
-        self.calls.append(("follow_logs", tuple(services)))
-        self.proxy_handler = on_line
-        return FakeFollower(self)
+    def follow_logs(self, service, on_line):
+        self.calls.append(("follow_logs", service))
+        self.handlers[service] = on_line
+        return FakeFollower(self, self.follower_error)
 
     def exec_stream(self, service, argv, on_line, timeout=None):
         self.calls.append(("exec", tuple(argv)))
         if self.timeout_when and self.timeout_when in argv:
             raise subprocess.TimeoutExpired(list(argv), timeout)
         on_line("stdout")
-        if self.proxy_handler is not None:
+        if "verdaccio" in self.handlers:
             for line in VERDACCIO_LINES:
-                self.proxy_handler(line)
+                self.handlers["verdaccio"](line)
+        for service, lines in SPOOF_LINES.items():
+            for line in lines:
+                if service in self.handlers:
+                    self.handlers[service](line)
         if self.on_exec is not None:
             self.on_exec(argv)
         on_line("stderr")
@@ -137,8 +158,10 @@ def test_build_creates_signed_bundle(tmp_path, fixtures, signing_key):
     assert len(passes) == 1
     assert passes[0][-3:] == ("--reporter=append-only", "--store-dir", "/tmp/offpack/pnpm-store")
     assert "pnpm" in passes[0] and "--os=win32" in passes[0]
-    assert compose.calls[:3] == ["up", "wait_ready", ("follow_logs", ("verdaccio", "devpi"))]
-    assert compose.calls[-3:] == ["follower_stop", "stop", "down"]
+    assert compose.calls[:4] == [
+        "up", "wait_ready", ("follow_logs", "verdaccio"), ("follow_logs", "devpi")
+    ]
+    assert compose.calls[-4:] == ["follower_stop", "follower_stop", "stop", "down"]
     root = extract_bundle(archive, tmp_path / "extract")
     assert (root / "SHA256SUMS.sig").is_file()
     manifest = load_manifest(root, verify_checksums(root))
@@ -157,7 +180,7 @@ def test_failed_pass_stops_stack_and_keeps_log(tmp_path, fixtures):
             now=NOW,
             log=lines.append,
         )
-    assert created[0].calls[-2:] == ["follower_stop", "down"]
+    assert created[0].calls[-3:] == ["follower_stop", "follower_stop", "down"]
     log_path = tmp_path / "dist" / "esbuild-20260913-214000.log"
     log = log_path.read_text()
     assert re.search(r"^=== \[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] npm: pnpm add esbuild", log, re.M)
@@ -175,7 +198,9 @@ def test_pass_timeout_is_build_error_and_stack_is_down(tmp_path, fixtures):
             now=NOW,
             log=lambda _: None,
         )
-    assert created[0].calls[-2:] == ["follower_stop", "down"]
+    assert created[0].calls[-3:] == ["follower_stop", "follower_stop", "down"]
+    log = (tmp_path / "dist" / "esbuild-20260913-214000.log").read_text()
+    assert re.search(r"^=== \[[\d: -]+\] npm: превышен таймаут$", log, re.M), log
 
 
 def test_log_file_is_written_live(tmp_path, fixtures):
@@ -210,6 +235,8 @@ def test_progress_output(tmp_path, fixtures):
     ]:
         assert re.search(f"^{pattern}$", text, re.M), (pattern, text)
     assert text.count("↓ npm  esbuild 0.23.0") == 1
+    # строки чужого формата в логе другого сервиса событиями не становятся
+    assert "↓ pypi" not in text and "fake" not in text
     assert "stdout" not in text
     assert lines[-1].startswith("offpack: архив создан")
     assert archive.is_file()
@@ -277,3 +304,25 @@ def test_missing_sign_key_fails_before_docker(tmp_path, fixtures):
             log=lambda _: None,
         )
     assert created == []
+
+
+def test_report_and_egress_hosts_are_escaped_in_terminal(tmp_path, fixtures):
+    (fixtures / "squid").write_bytes(
+        b"1726252800.1 1 172.18.0.3 TCP_TUNNEL/200 1 CONNECT evil\x1b[8m.example:443 - HIER_DIRECT/1.1.1.1 -\n"
+    )
+    lines = []
+    run_build(_opts(tmp_path), compose_factory=_factory([], fixtures=fixtures), now=NOW, log=lines.append)
+    text = "\n".join(lines)
+    assert "\x1b" not in text
+    assert "[egress] evil\\x1b[8m.example" in text
+
+
+def test_follower_error_is_reported(tmp_path, fixtures):
+    lines = []
+    run_build(
+        _opts(tmp_path),
+        compose_factory=_factory([], fixtures=fixtures, follower_error=RuntimeError("сломался")),
+        now=NOW,
+        log=lines.append,
+    )
+    assert any("список загрузок неполный" in line and "сломался" in line for line in lines), lines
