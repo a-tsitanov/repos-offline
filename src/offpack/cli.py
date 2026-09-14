@@ -10,6 +10,8 @@ from pathlib import Path
 from offpack import __version__
 from offpack.build import BuildOptions, run_build
 from offpack.errors import OffpackError
+from offpack.importer import ImportOptions, run_import
+from offpack.nexus import NexusClient
 from offpack.platforms import (
     DEFAULT_PLATFORMS,
     DEFAULT_PYTHONS,
@@ -31,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"offpack {__version__}")
     sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
     _add_build(sub)
+    _add_import(sub)
     return parser
 
 
@@ -84,6 +87,51 @@ def _cmd_build(args: argparse.Namespace) -> int:
     )
     print(f"готово: {archive}")
     return 0
+
+
+def _add_import(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "import",
+        help="импортировать архив в Nexus (офлайн)",
+        description="Учётные данные: переменные NEXUS_USER и NEXUS_PASSWORD.",
+    )
+    p.add_argument("archive", type=Path, help="архив offpack .tar.gz")
+    p.add_argument("--nexus", required=True, help="адрес Nexus, например http://nexus:8081")
+    p.add_argument("--npm-repo", default="npm-hosted", help="hosted npm-репозиторий")
+    p.add_argument("--pypi-repo", default="pypi-hosted", help="hosted PyPI-репозиторий")
+    trust = p.add_mutually_exclusive_group()
+    trust.add_argument(
+        "--allowed-signers",
+        type=Path,
+        help="файл allowed_signers OpenSSH (по умолчанию $OFFPACK_ALLOWED_SIGNERS)",
+    )
+    trust.add_argument("--allow-unsigned", action="store_true", help="не проверять подпись")
+    p.add_argument("--dry-run", action="store_true", help="только показать, что будет загружено")
+    p.set_defaults(func=_cmd_import)
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    allowed = args.allowed_signers
+    if allowed is None and not args.allow_unsigned and os.environ.get("OFFPACK_ALLOWED_SIGNERS"):
+        allowed = Path(os.environ["OFFPACK_ALLOWED_SIGNERS"])
+    client = NexusClient(
+        args.nexus,
+        user=os.environ.get("NEXUS_USER"),
+        password=os.environ.get("NEXUS_PASSWORD"),
+    )
+    report = run_import(
+        ImportOptions(
+            archive=args.archive,
+            npm_repo=args.npm_repo,
+            pypi_repo=args.pypi_repo,
+            allowed_signers=allowed,
+            allow_unsigned=args.allow_unsigned,
+            dry_run=args.dry_run,
+        ),
+        client,
+    )
+    print(report.render(dry_run=args.dry_run), end="")
+    return 0 if report.ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:

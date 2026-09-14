@@ -6,6 +6,7 @@ import pytest
 
 from offpack import cli
 from offpack.cli import main
+from tests.test_importer import make_archive
 
 
 def test_version(capsys):
@@ -66,3 +67,22 @@ def test_build_default_sign_key_path(monkeypatch):
 def test_build_without_command(capsys):
     assert main(["build", "--no-sign"]) == 2
     assert "не указана команда" in capsys.readouterr().err
+
+
+def test_import_command(tmp_path, signing_key, fake_nexus, monkeypatch, capsys):
+    key, allowed = signing_key
+    archive = make_archive(tmp_path, key)
+    monkeypatch.setenv("NEXUS_USER", "admin")
+    monkeypatch.setenv("NEXUS_PASSWORD", "secret")
+    code = main(["import", str(archive), "--nexus", fake_nexus.url, "--allowed-signers", str(allowed)])
+    assert code == 0
+    assert "загружено: 2" in capsys.readouterr().out
+    assert len(fake_nexus.uploads) == 2
+
+
+def test_import_requires_trust(tmp_path, signing_key, fake_nexus, monkeypatch, capsys):
+    monkeypatch.delenv("OFFPACK_ALLOWED_SIGNERS", raising=False)
+    key, _ = signing_key
+    code = main(["import", str(make_archive(tmp_path, key)), "--nexus", fake_nexus.url])
+    assert code == 2
+    assert "--allowed-signers" in capsys.readouterr().err
