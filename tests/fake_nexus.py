@@ -14,12 +14,21 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from offpack.pkgmeta import parse_pypi_filename
 
+# Nexus CE 3.96.1-01 до принятия EULA
+EULA_REQUIRED = (
+    '"You must accept the End User License Agreement (EULA) through the onboarding wizard '
+    'or REST API before proceeding."'
+)
+
 
 class FakeNexus:
     def __init__(self, *, user="admin", password="secret", allow_dist_tags=True):
         self.user = user
         self.password = password
         self.allow_dist_tags = allow_dist_tags
+        # ответ на повторную загрузку: статус и шаблон текста с {repo} и {filename}
+        self.duplicate_response = (400, "Repository does not allow updating assets: {repo}")
+        self.eula_accepted = True
         self.npm: dict[str, dict] = {}
         self.pypi: dict[str, set[str]] = {}
         self.uploads: list[tuple[str, str]] = []
@@ -102,6 +111,8 @@ class FakeNexus:
                 url = urlsplit(self.path)
                 if url.path != "/service/rest/v1/components":
                     return self._send(404)
+                if not fake.eula_accepted:
+                    return self._send(403, EULA_REQUIRED.encode(), "application/json")
                 repo = parse_qs(url.query)["repository"][0]
                 raw = b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n"
                 message = BytesParser(policy=default_policy).parsebytes(raw + self._body())
@@ -110,10 +121,9 @@ class FakeNexus:
                 filename = part.get_filename()
                 data = part.get_payload(decode=True)
                 if (repo, filename) in fake.uploads:
-                    return self._send(
-                        400,
-                        f"Repository does not allow updating assets: {repo}".encode(),
-                    )
+                    status, template = fake.duplicate_response
+                    text = template.format(repo=repo, filename=filename)
+                    return self._send(status, text.encode())
                 if field == "npm.asset":
                     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
                         meta = json.load(archive.extractfile("package/package.json"))

@@ -194,7 +194,7 @@ class InstallPlan:
 1. Распаковка во временную папку с `tarfile` и `filter="data"`: абсолютные пути, `..`, ссылки и спецфайлы отклоняются.
 2. Проверка подписи `SHA256SUMS`, затем sha256 каждого файла. Любое расхождение останавливает импорт, в Nexus ничего не загружается.
 3. Проверка, что каждый файл из `manifest.json` есть в `SHA256SUMS` и наоборот.
-4. Для каждого файла: проверка наличия в Nexus через протокольные эндпоинты самого репозитория. Для npm — packument `GET /repository/<repo>/<name>` (версия есть в `versions`), для PyPI — simple-индекс `GET /repository/<repo>/simple/<name>/` (имя файла есть в ссылках). Если файл есть, он пропускается. Иначе — `POST /service/rest/v1/components?repository=<repo>` с полем `npm.asset` или `pypi.asset`. Ответ 400 «does not allow updating» тоже считается пропуском.
+4. Для каждого файла: проверка наличия в Nexus через протокольные эндпоинты самого репозитория. Для npm — packument `GET /repository/<repo>/<name>` (версия есть в `versions`), для PyPI — simple-индекс `GET /repository/<repo>/simple/<name>/` (имя файла есть в ссылках). Если файл есть, он пропускается. Иначе — `POST /service/rest/v1/components?repository=<repo>` с полем `npm.asset` или `pypi.asset`. Ответ 400 «does not allow updating» (старые версии Nexus) или 409 «already exists» (Nexus 3.96) тоже считается пропуском.
 5. Для каждого npm-пакета после загрузки: чтение packument. Если `dist-tags.latest` меньше максимальной стабильной версии, выполняется `PUT /repository/<repo>/-/package/<name>/dist-tags/latest`. При неудаче — предупреждение, импорт не падает.
 6. Итог: загружено, пропущено, ошибки. Код выхода ненулевой, если была хотя бы одна ошибка загрузки.
 
@@ -233,9 +233,13 @@ class InstallPlan:
   - `uv tool install ruff`: в архиве должны быть wheel `manylinux…x86_64` и `win_amd64`.
 - **E2E (маркер `nexus`, запускается вручную):** контейнер `sonatype/nexus3`, создание hosted-репо через API, импорт архива, затем установка из Nexus в контейнере без сети.
 
-## Риски и что проверить на реальном стенде
+## Риски и результаты проверки на реальном стенде
 
-- Поддержка dist-tag API в hosted npm-репо зависит от версии Nexus. Если API нет, остаётся предупреждение.
-- Совместимость uv с devpi (PEP 691 JSON, PEP 658 metadata). При проблемах запасной вариант — `pip download` вместо `uv pip install` в матричных проходах.
-- Формат ответа Nexus на повторную загрузку (400 «does not allow updating») при `writePolicy: allow_once`. Проверяется e2e-тестом.
-- Образ `sonatype/nexus3` на arm64 (машина разработки — Apple Silicon): при отсутствии e2e запускается с `platform: linux/amd64` через эмуляцию.
+Проверено e2e-тестом `tests/test_e2e_nexus.py` 2026-09-14 на образе `sonatype/nexus3:latest` = Nexus 3.96.1-01 (Community Edition), arm64.
+
+- dist-tag API в hosted npm-репо: `PUT /repository/<repo>/-/package/<name>/dist-tags/latest` в 3.96.1-01 всегда отвечает 400 `{"success":false,"error":"Unable to update latest tag"}` (для любой версии, в том числе текущей); другие теги (например `beta`) выставляются. Тест `test_npm_dist_tag_api` — XFAIL. При этом загрузка более старой версии после новой не сдвигает `latest` назад (проверено: после 0.28.2 загружена 0.25.0, `latest` остался 0.28.2), поэтому исправление dist-tag на этой версии не требуется; если оно всё же понадобится, импорт выдаёт предупреждение и не падает.
+- Совместимость uv с devpi (PEP 691 JSON, PEP 658 metadata). При проблемах запасной вариант — `pip download` вместо `uv pip install` в матричных проходах. На сборке esbuild и ruff проблем не было.
+- Ответ Nexus на повторную загрузку при `writePolicy: allow_once`: в 3.96.1-01 это 409 `ValidationErrorXO{... cannot be updated as asset already exists and redeploy is not allowed}` (и для npm, и для PyPI), а не 400 «does not allow updating». `nexus.py` считает пропуском оба варианта.
+- Nexus Community Edition (проверено на 3.96.1-01) до принятия EULA отвечает 403 на загрузку компонентов, хотя создание репозиториев через API работает. EULA принимается в мастере первого входа или через `POST /service/rest/v1/system/eula` (e2e-тест делает это сам). Текст причины от Nexus выводится в ошибке `offpack import`.
+- Образ `sonatype/nexus3` на arm64: для 3.96.1-01 есть нативный arm64-образ, эмуляция `linux/amd64` не нужна.
+- Установка из Nexus без интернета (контейнер во внутренней docker-сети только с Nexus): `npm install esbuild` и `uv pip install ruff` из hosted-репо проходят.

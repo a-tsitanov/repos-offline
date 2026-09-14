@@ -85,6 +85,9 @@ class NexusClient:
         text = payload.decode("utf-8", errors="replace")
         if status == 400 and "does not allow updating" in text:
             return False
+        # Nexus 3.96.1: 409 «cannot be updated as asset already exists»
+        if status == 409 and "already exists" in text:
+            return False
         raise NexusError(f"загрузка {path.name}: HTTP {status}: {text[:500]}")
 
     def set_npm_latest(self, repo: str, name: str, version: str) -> None:
@@ -121,9 +124,11 @@ class NexusClient:
             reason = getattr(exc, "reason", exc)
             raise NexusError(f"Nexus недоступен ({self.base_url}): {reason}") from exc
         if status in (401, 403):
+            # причина от Nexus, например непринятая EULA в Community Edition
+            reason = payload.decode("utf-8", errors="replace").strip()[:300]
             raise NexusAuthError(
                 f"Nexus ответил {status} на {method} {path}: проверьте NEXUS_USER, "
-                "NEXUS_PASSWORD и права пользователя"
+                "NEXUS_PASSWORD и права пользователя" + (f" ({reason})" if reason else "")
             )
         return status, payload
 

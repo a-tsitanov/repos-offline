@@ -36,11 +36,31 @@ def test_pypi_filenames(client, fake_nexus):
     assert client.pypi_filenames("pypi-hosted", "Ruff") == {"ruff-0.6.0-py3-none-win_amd64.whl"}
 
 
-def test_upload_npm_twice(client, fake_nexus, tmp_path):
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        (400, "Repository does not allow updating assets: {repo}"),
+        # Nexus 3.96.1-01: 409 вместо 400
+        (
+            409,
+            "ValidationErrorXO{{id='*', message='{repo}/{filename} -  cannot be updated "
+            "as asset already exists and redeploy is not allowed'}}",
+        ),
+    ],
+)
+def test_upload_npm_twice(client, fake_nexus, tmp_path, duplicate):
+    fake_nexus.duplicate_response = duplicate
     tgz = make_npm_tgz(tmp_path, "@s/pkg", "1.2.0")
     assert client.upload("npm-hosted", "npm", tgz) is True
     assert client.upload("npm-hosted", "npm", tgz) is False
     assert fake_nexus.npm["@s/pkg"]["dist-tags"]["latest"] == "1.2.0"
+
+
+def test_upload_forbidden_shows_nexus_reason(client, fake_nexus, tmp_path):
+    fake_nexus.eula_accepted = False
+    whl = make_file(tmp_path, "six-1.16.0-py2.py3-none-any.whl", b"\x00\x01binary")
+    with pytest.raises(NexusAuthError, match="EULA"):
+        client.upload("pypi-hosted", "pypi", whl)
 
 
 def test_upload_pypi(client, fake_nexus, tmp_path):
