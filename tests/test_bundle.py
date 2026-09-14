@@ -1,6 +1,8 @@
 import io
 import json
+import os
 import tarfile
+import zlib
 from datetime import UTC, datetime
 
 import pytest
@@ -138,6 +140,59 @@ def test_extract_rejects_symlink(tmp_path):
     link.linkname = "/etc/passwd"
     with pytest.raises(BundleError):
         extract_bundle(_tar_with(tmp_path, link), tmp_path / "extract")
+
+
+def test_extract_truncated_archive(tmp_path):
+    path = tmp_path / "big.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        for number in range(3):
+            data = os.urandom(200_000)
+            info = tarfile.TarInfo(f"b/f{number}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    raw = path.read_bytes()
+    path.write_bytes(raw[: len(raw) // 2])
+    with pytest.raises(BundleError, match="не удалось распаковать"):
+        extract_bundle(path, tmp_path / "extract")
+
+
+def test_extract_zlib_error(tmp_path, monkeypatch):
+    archive = pack_bundle(_stage(tmp_path), tmp_path / "out")
+
+    def broken(self):
+        raise zlib.error("invalid distance too far back")
+
+    monkeypatch.setattr(tarfile.TarFile, "getmembers", broken)
+    with pytest.raises(BundleError, match="не удалось распаковать"):
+        extract_bundle(archive, tmp_path / "extract")
+
+
+def test_pack_writes_part_then_renames(tmp_path, monkeypatch):
+    bundle_dir = _stage(tmp_path)
+    out = tmp_path / "out"
+    seen = []
+    original = tarfile.TarFile.add
+
+    def spy(self, name, *args, **kwargs):
+        seen.append(sorted(p.name for p in out.iterdir()))
+        return original(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile.TarFile, "add", spy)
+    archive = pack_bundle(bundle_dir, out)
+    assert seen[0] == ["cowsay-20260913-214000.tar.gz.part"]
+    assert sorted(p.name for p in out.iterdir()) == [archive.name]
+
+
+def test_pack_failure_removes_part(tmp_path, monkeypatch):
+    bundle_dir = _stage(tmp_path)
+
+    def fail(self, *args, **kwargs):
+        raise OSError("диск заполнен")
+
+    monkeypatch.setattr(tarfile.TarFile, "add", fail)
+    with pytest.raises(OSError, match="диск заполнен"):
+        pack_bundle(bundle_dir, tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
 
 
 def test_extract_rejects_multiple_roots(tmp_path):

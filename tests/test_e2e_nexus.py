@@ -24,7 +24,7 @@ from offpack.platforms import parse_platforms
 
 pytestmark = [pytest.mark.docker, pytest.mark.nexus]
 
-NEXUS_IMAGE = os.environ.get("OFFPACK_E2E_NEXUS_IMAGE", "sonatype/nexus3:latest")
+NEXUS_IMAGE = os.environ.get("OFFPACK_E2E_NEXUS_IMAGE", "sonatype/nexus3:3.96.1-01")
 
 
 def _docker(*args, check=True):

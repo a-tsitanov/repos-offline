@@ -105,6 +105,13 @@ def run_build(
         if has_egress_log:
             egress = (work / "access.log").read_text(encoding="utf-8", errors="replace")
             notices.extend(Notice("egress", host) for host in parse_egress_log(egress))
+        else:
+            notices.append(
+                Notice(
+                    "egress_log_missing",
+                    "не удалось получить access.log squid: внешние загрузки не проверены",
+                )
+            )
         notices.extend(sdist_only_notices(files, opts.platforms))
         meta = BundleMeta(
             created_at=started,

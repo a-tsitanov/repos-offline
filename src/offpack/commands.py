@@ -41,6 +41,10 @@ _NPM_VALUE_FLAGS = frozenset(
         "--tag",
         "--install-strategy",
         "--before",
+        "--loglevel",
+        "--os",
+        "--cpu",
+        "--libc",
     }
 )
 _NPX_VALUE_FLAGS = _NPM_VALUE_FLAGS | {"-p", "--package", "-c", "--call"}
@@ -94,6 +98,11 @@ _UV_VALUE_FLAGS = frozenset(
         "--allow-insecure-host",
         "--no-binary-package",
         "--no-build-package",
+        "--python-preference",
+        "-C",
+        "--config-setting",
+        "--config-settings",
+        "--config-settings-package",
     }
 )
 _UV_TOOL_VALUE_FLAGS = _UV_VALUE_FLAGS | {"--from", "--with", "-w"}

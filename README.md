@@ -8,9 +8,13 @@
 
 ## Требования
 
-- Онлайн-машина: Python ≥ 3.12, Docker с compose v2, OpenSSH (`ssh-keygen`), интернет.
-- Офлайн-машина с доступом к Nexus: Python ≥ 3.12, OpenSSH. Больше ничего ставить не нужно —
-  у offpack нет зависимостей.
+- Онлайн-машина: Python ≥ 3.12, Docker с compose v2, OpenSSH ≥ 8.1 (`ssh-keygen`), интернет.
+- Офлайн-машина с доступом к Nexus: Python ≥ 3.12, OpenSSH ≥ 8.1. Больше ничего ставить не
+  нужно — у offpack нет зависимостей.
+
+Подпись и проверка идут через `ssh-keygen -Y`, он появился в OpenSSH 8.1. Во встроенном
+OpenSSH старых сборок Windows 10 (7.7) его нет: проверьте `ssh -V` и при необходимости
+обновите OpenSSH.
 
 ## Установка
 
@@ -32,6 +36,10 @@ printf 'offpack %s\n' "$(cut -d' ' -f1,2 ~/.config/offpack/signing_key.pub)" > a
 
 Файл `allowed_signers` перенести в офлайн. Приватный ключ никуда не переносить.
 
+Пути можно не указывать в каждой команде: `build` берёт ключ из `$OFFPACK_SIGN_KEY`
+(иначе `~/.config/offpack/signing_key`), `import` — файл из `$OFFPACK_ALLOWED_SIGNERS`,
+если не заданы `--allowed-signers` и `--allow-unsigned`.
+
 ## Сборка (онлайн)
 
 ```bash
@@ -43,8 +51,15 @@ offpack build --platform win-x64 --python 3.11,3.12 -- pip install requests
 Поддерживаются `npx`, `npm install|i|exec`, `uvx`, `uv tool install|run`, `uv pip install`,
 `pip install`, `python -m pip install` со спецификациями пакетов. Инструмент не запускается,
 только устанавливается. Результат: `dist/<имя>-<время>.tar.gz`, рядом лог `.log`.
-Перед переносом прочитайте отчёт в конце вывода: предупреждения `egress` означают загрузки
-не из реестров (в Nexus они не попадут), `sdist_only` — на клиенте нужна сборка из исходников.
+Перед переносом прочитайте отчёт в конце вывода (он же `report.txt` в архиве):
+
+- Список пакетов. Проверьте, что в нём нет неожиданных имён, особенно похожих на внутренние
+  (scope вашей организации, внутренние названия). Код в песочнице может заставить прокси
+  скачать любой публичный пакет, и он попадёт в архив; публичный `@corp/utils` в Nexus
+  подменит внутренний пакет с тем же именем (dependency confusion). Такой архив не переносите.
+- `egress` — загрузки не из реестров, в Nexus они не попадут.
+- `egress_log_missing` — лог прокси не получен, внешние загрузки не проверены.
+- `sdist_only` — на клиенте нужна сборка из исходников.
 
 Опции: `--platform linux-x64,win-x64`, `--python 3.12`, `--out dist`, `--sign-key PATH` или
 `--no-sign`, `--timeout 900`, `--keep` (оставить стек для отладки).
@@ -58,15 +73,33 @@ offpack import archive.tar.gz --nexus http://nexus:8081 --allowed-signers allowe
 ```
 
 Опции: `--npm-repo npm-hosted`, `--pypi-repo pypi-hosted`, `--allow-unsigned`.
-Уже имеющиеся в Nexus файлы пропускаются. Код выхода 1 — были ошибки загрузки.
+Уже имеющиеся в Nexus файлы пропускаются.
+
+## Коды выхода
+
+| Код | Значение |
+|---|---|
+| 0 | успешно |
+| 1 | `import`: были ошибки загрузки отдельных файлов |
+| 2 | ошибка offpack: неверные аргументы, сборка не удалась, архив или подпись не прошли проверку, Nexus недоступен, ошибка файловой системы |
+| 130 | прервано (Ctrl+C) |
 
 ## Настройка Nexus
 
 - Community Edition: принять EULA (мастер первого входа), иначе загрузка отвечает 403.
 - Hosted-репозитории `npm-hosted` и `pypi-hosted` (Deployment policy: Disable redeploy).
 - Group-репозитории `npm-all` и `pypi-all`, включающие hosted.
-- Пользователь для импорта с правами `nx-component-upload` и `nx-repository-view-*-*-edit`
-  на оба hosted-репозитория.
+- Роль для пользователя импорта с привилегиями:
+  - `nx-component-upload`;
+  - `nx-repository-view-npm-npm-hosted-browse`, `-read`, `-add`, `-edit`;
+  - `nx-repository-view-pypi-pypi-hosted-browse`, `-read`, `-add`, `-edit`.
+
+  Для других имён репозиториев (`--npm-repo`, `--pypi-repo`) подставьте их в имена привилегий.
+- Клиентам нужно чтение из `npm-all` и `pypi-all`: либо включите анонимный доступ
+  (Security → Anonymous Access; у роли пользователя anonymous должны быть
+  `nx-repository-view-npm-npm-all-browse`/`-read` и `nx-repository-view-pypi-pypi-all-browse`/`-read`,
+  стандартная `nx-anonymous` даёт чтение всех репозиториев), либо выдайте клиентам
+  учётные данные.
 
 ## Настройка клиентов
 

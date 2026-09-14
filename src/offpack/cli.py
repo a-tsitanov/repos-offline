@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from offpack import __version__
 from offpack.build import BuildOptions, run_build
@@ -110,7 +111,17 @@ def _add_import(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_import)
 
 
+def _check_nexus_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise OffpackError(
+            f"--nexus: нужен адрес вида http://nexus:8081 или https://nexus.example,"
+            f" получено {url!r}"
+        )
+
+
 def _cmd_import(args: argparse.Namespace) -> int:
+    _check_nexus_url(args.nexus)
     allowed = args.allowed_signers
     if allowed is None and not args.allow_unsigned and os.environ.get("OFFPACK_ALLOWED_SIGNERS"):
         allowed = Path(os.environ["OFFPACK_ALLOWED_SIGNERS"])
@@ -143,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         return func(args)
-    except OffpackError as exc:
+    except (OffpackError, OSError) as exc:
         print(f"offpack: ошибка: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("offpack: прервано", file=sys.stderr)
+        return 130

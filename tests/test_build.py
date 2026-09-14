@@ -124,6 +124,21 @@ def test_failed_pass_stops_stack_and_keeps_log(tmp_path, fixtures):
     assert not list((tmp_path / "dist").glob("*.tar.gz"))
 
 
+def test_missing_egress_log_adds_notice(tmp_path, fixtures):
+    (fixtures / "squid").unlink()
+    archive = run_build(
+        _opts(tmp_path),
+        compose_factory=_factory([], fixtures=fixtures),
+        now=NOW,
+        log=lambda _: None,
+    )
+    root = extract_bundle(archive, tmp_path / "extract")
+    manifest = load_manifest(root, verify_checksums(root))
+    kinds = [w.kind for w in manifest.warnings]
+    assert "egress_log_missing" in kinds
+    assert "egress" not in kinds
+
+
 def test_no_files_is_error(tmp_path):
     with pytest.raises(BuildError, match="не собрано ни одного файла"):
         run_build(

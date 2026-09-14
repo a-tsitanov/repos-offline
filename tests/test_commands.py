@@ -37,6 +37,18 @@ from offpack.errors import OffpackError
         (["pip", "install", "-i", "http://x/simple", "requests"], "pypi", ("requests",)),
         (["pip3.12", "install", "--only-binary", ":all:", "numpy"], "pypi", ("numpy",)),
         (["python3", "-m", "pip", "install", "--upgrade", "requests"], "pypi", ("requests",)),
+        (["npm", "install", "--loglevel", "silly", "foo"], "npm", ("foo",)),
+        (["npm", "i", "--os", "win32", "foo"], "npm", ("foo",)),
+        (["npm", "i", "--cpu", "x64", "--libc", "glibc", "foo"], "npm", ("foo",)),
+        (["npx", "--loglevel", "warn", "cowsay"], "npm", ("cowsay",)),
+        (["uvx", "--python-preference", "only-managed", "ruff"], "pypi", ("ruff",)),
+        (["uvx", "-C", "k=v", "ruff"], "pypi", ("ruff",)),
+        (
+            ["uv", "tool", "install", "--config-setting", "k=v", "--config-settings-package", "p:k=v", "x"],
+            "pypi",
+            ("x",),
+        ),
+        (["uv", "pip", "install", "--python-preference", "system", "requests"], "pypi", ("requests",)),
     ],
 )
 def test_mapped(argv, ecosystem, specs):

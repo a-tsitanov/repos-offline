@@ -80,6 +80,34 @@ def test_import_command(tmp_path, signing_key, fake_nexus, monkeypatch, capsys):
     assert len(fake_nexus.uploads) == 2
 
 
+@pytest.mark.parametrize("nexus", ["nexus:8081", "nexus", "ftp://nexus", "http://"])
+def test_import_rejects_bad_nexus_url(tmp_path, monkeypatch, capsys, nexus):
+    monkeypatch.setattr(cli, "run_import", lambda *a, **k: pytest.fail("импорт не должен начаться"))
+    code = main(["import", str(tmp_path / "a.tar.gz"), "--nexus", nexus, "--allow-unsigned"])
+    assert code == 2
+    assert "--nexus" in capsys.readouterr().err
+
+
+def test_os_error_is_reported_without_traceback(monkeypatch, capsys):
+    def fail(opts):
+        raise PermissionError(13, "Permission denied", "dist")
+
+    monkeypatch.setattr(cli, "run_build", fail)
+    assert main(["build", "--no-sign", "--", "npx", "cowsay"]) == 2
+    err = capsys.readouterr().err
+    assert "offpack: ошибка:" in err and "Permission denied" in err
+    assert "Traceback" not in err
+
+
+def test_keyboard_interrupt_exits_130(monkeypatch, capsys):
+    def interrupt(opts):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_build", interrupt)
+    assert main(["build", "--no-sign", "--", "npx", "cowsay"]) == 130
+    assert "прервано" in capsys.readouterr().err
+
+
 def test_import_requires_trust(tmp_path, signing_key, fake_nexus, monkeypatch, capsys):
     monkeypatch.delenv("OFFPACK_ALLOWED_SIGNERS", raising=False)
     key, _ = signing_key

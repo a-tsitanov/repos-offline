@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 
@@ -38,7 +39,7 @@ class _LinkParser(HTMLParser):
 class NexusClient:
     base_url: str
     user: str | None = None
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)
     timeout: float = 120.0
 
     def check(self) -> None:
@@ -109,18 +110,21 @@ class NexusClient:
         body: bytes | None = None,
         content_type: str | None = None,
     ) -> tuple[int, bytes]:
-        request = urllib.request.Request(self.base_url.rstrip("/") + path, data=body, method=method)
-        if content_type:
-            request.add_header("Content-Type", content_type)
-        if self.user is not None:
-            token = base64.b64encode(f"{self.user}:{self.password or ''}".encode()).decode()
-            request.add_header("Authorization", f"Basic {token}")
         try:
+            request = urllib.request.Request(
+                self.base_url.rstrip("/") + path, data=body, method=method
+            )
+            if content_type:
+                request.add_header("Content-Type", content_type)
+            if self.user is not None:
+                token = base64.b64encode(f"{self.user}:{self.password or ''}".encode()).decode()
+                request.add_header("Authorization", f"Basic {token}")
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 status, payload = response.status, response.read()
         except urllib.error.HTTPError as exc:
             status, payload = exc.code, exc.read()
-        except OSError as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # ValueError: неверный адрес (нет схемы, нечисловой порт)
             reason = getattr(exc, "reason", exc)
             raise NexusError(f"Nexus недоступен ({self.base_url}): {reason}") from exc
         if status in (401, 403):
@@ -137,11 +141,11 @@ def _npm_path(name: str) -> str:
     return urllib.parse.quote(name, safe="@")
 
 
-def _multipart(field: str, path: Path) -> tuple[bytes, str]:
+def _multipart(field_name: str, path: Path) -> tuple[bytes, str]:
     boundary = f"offpack-{secrets.token_hex(16)}"
     head = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="{field}"; filename="{path.name}"\r\n'
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{path.name}"\r\n'
         "Content-Type: application/octet-stream\r\n\r\n"
     ).encode()
     tail = f"\r\n--{boundary}--\r\n".encode()

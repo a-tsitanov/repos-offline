@@ -36,6 +36,15 @@ def test_collect_pypi(tmp_path):
     ]
 
 
+def test_collect_pypi_ignores_other_indexes(tmp_path):
+    serverdir = tmp_path / "pypi"
+    make_file(serverdir / "+files" / "root" / "pypi" / "+f" / "472" / "1f3", "six-1.17.0-py2.py3-none-any.whl")
+    make_file(serverdir / "+files" / "evil" / "dev" / "+f" / "ab", "evil-99.0-py3-none-any.whl")
+    make_file(serverdir / "+files" / "root" / "evil" / "+f" / "cd", "evil2-1.0.tar.gz")
+    make_file(serverdir, "stray-1.0-py3-none-any.whl")
+    assert [f.bundle_name for f in collect_pypi(serverdir)] == ["six-1.17.0-py2.py3-none-any.whl"]
+
+
 SQUID_LOG = """\
 1726252800.123    456 172.18.0.3 TCP_TUNNEL/200 1234 CONNECT github.com:443 - HIER_DIRECT/140.82.112.3 -
 1726252801.000     12 172.18.0.3 TCP_MISS/200 99 GET http://nodejs.org/dist/index.json - HIER_DIRECT/1.2.3.4 application/json

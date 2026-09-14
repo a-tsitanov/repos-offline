@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
 import tarfile
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -276,8 +278,15 @@ def pack_bundle(bundle_dir: Path, out_dir: Path) -> Path:
     archive = out_dir / f"{bundle_dir.name}.tar.gz"
     if archive.exists():
         raise BundleError(f"файл уже существует: {archive}")
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(bundle_dir, arcname=bundle_dir.name)
+    # пишем во временный файл: прерванная упаковка не оставит битый архив под итоговым именем
+    part = archive.with_name(f"{archive.name}.part")
+    try:
+        with tarfile.open(part, "w:gz") as tar:
+            tar.add(bundle_dir, arcname=bundle_dir.name)
+        os.replace(part, archive)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     return archive
 
 
@@ -297,7 +306,8 @@ def extract_bundle(archive: Path, dest: Path) -> Path:
             if len(roots) != 1:
                 raise BundleError("в архиве должен быть ровно один корневой каталог")
             tar.extractall(dest, members=members, filter="data")
-    except (tarfile.TarError, OSError) as exc:
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
+        # EOFError и zlib.error — обрезанный или повреждённый gzip
         raise BundleError(f"не удалось распаковать {archive.name}: {exc}") from exc
     root = dest / roots.pop()
     if not root.is_dir():

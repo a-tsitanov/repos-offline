@@ -13,13 +13,19 @@ from offpack.errors import OffpackError
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
-READY_PROBES = {
-    "verdaccio": "http://verdaccio:4873/-/ping",
-    "devpi": "http://devpi:3141/+api",
-}
-_FETCH_PROBE = (
+_OK_PROBE = (
     "fetch(process.argv[1]).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 )
+_ANY_RESPONSE_PROBE = (
+    "fetch(process.argv[1]).then(() => process.exit(0), () => process.exit(1))"
+)
+# сервис → (адрес, скрипт node); fetch в node не использует HTTP_PROXY
+READY_PROBES = {
+    "verdaccio": ("http://verdaccio:4873/-/ping", _OK_PROBE),
+    "devpi": ("http://devpi:3141/+api", _OK_PROBE),
+    # на запрос к себе squid отвечает ошибкой: готовность — любой HTTP-ответ
+    "squid": ("http://squid:3128/", _ANY_RESPONSE_PROBE),
+}
 _MISSING_PATH = ("Could not find the file", "No such container:path")
 
 
@@ -78,9 +84,9 @@ class Compose:
         deadline = time.monotonic() + timeout
         pending = dict(READY_PROBES)
         while True:
-            for name, url in list(pending.items()):
+            for name, (url, script) in list(pending.items()):
                 try:
-                    probe = self.exec("sandbox", ["node", "-e", _FETCH_PROBE, url], timeout=30)
+                    probe = self.exec("sandbox", ["node", "-e", script, url], timeout=30)
                 except subprocess.TimeoutExpired:
                     continue
                 if probe.returncode == 0:

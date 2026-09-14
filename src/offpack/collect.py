@@ -18,6 +18,8 @@ from offpack.pkgmeta import (
 from offpack.platforms import Platform
 
 PROXY_HOSTS = frozenset({"verdaccio", "devpi"})
+# Файловое хранилище зеркала root/pypi внутри serverdir devpi.
+DEVPI_MIRROR_FILES = ("+files", "root", "pypi", "+f")
 
 
 def collect_npm(storage: Path) -> list[PackageFile]:
@@ -32,11 +34,16 @@ def collect_npm(storage: Path) -> list[PackageFile]:
 
 
 def collect_pypi(serverdir: Path) -> list[PackageFile]:
-    """Все wheel и sdist из serverdir devpi; служебные файлы игнорируются."""
-    if not serverdir.is_dir():
+    """Wheel и sdist зеркала root/pypi из serverdir devpi.
+
+    Файлы других индексов и служебные файлы игнорируются: в архив попадает только
+    то, что devpi скачал с PyPI.
+    """
+    mirror = serverdir.joinpath(*DEVPI_MIRROR_FILES)
+    if not mirror.is_dir():
         return []
     files = []
-    for path in sorted(p for p in serverdir.rglob("*") if p.is_file()):
+    for path in sorted(p for p in mirror.rglob("*") if p.is_file()):
         parsed = parse_pypi_filename(path.name)
         if parsed is None:
             continue

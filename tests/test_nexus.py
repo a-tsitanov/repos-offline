@@ -23,6 +23,16 @@ def test_unreachable():
         NexusClient("http://127.0.0.1:9", timeout=2).check()
 
 
+@pytest.mark.parametrize("base_url", ["nexus", "http://127.0.0.1:abc"])
+def test_invalid_base_url(base_url):
+    with pytest.raises(NexusError):
+        NexusClient(base_url, timeout=2).check()
+
+
+def test_repr_hides_password():
+    assert "hunter2" not in repr(NexusClient("http://nexus:8081", "admin", "hunter2"))
+
+
 def test_npm_packument(client, fake_nexus):
     assert client.npm_packument("npm-hosted", "@s/pkg") is None
     fake_nexus.add_npm("@s/pkg", "1.0.0")

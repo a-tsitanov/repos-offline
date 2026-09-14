@@ -65,6 +65,23 @@ def test_wait_ready_times_out(tmp_path):
         Compose("p", tmp_path, runner=runner).wait_ready(timeout=0, interval=0)
 
 
+def test_wait_ready_waits_for_squid(tmp_path):
+    squid = "http://squid:3128/"
+    runner = Recorder({squid: (1, "", "")})
+    with pytest.raises(ComposeError, match="не поднялись: squid$"):
+        Compose("p", tmp_path, runner=runner).wait_ready(timeout=0, interval=0)
+    probe = next(argv for argv in runner.calls if squid in argv)
+    # squid отвечает на запрос к себе ошибкой: готовность — любой HTTP-ответ
+    assert "r.ok" not in probe[-2]
+
+
+def test_wait_ready_all_services_up(tmp_path):
+    runner = Recorder()
+    Compose("p", tmp_path, runner=runner).wait_ready(timeout=0, interval=0)
+    probed = {argv[-1] for argv in runner.calls}
+    assert probed == {"http://verdaccio:4873/-/ping", "http://devpi:3141/+api", "http://squid:3128/"}
+
+
 def test_wait_ready_treats_probe_timeout_as_not_ready(tmp_path):
     def runner(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, 30)
