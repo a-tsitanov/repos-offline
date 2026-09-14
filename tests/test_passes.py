@@ -1,11 +1,11 @@
+import subprocess
+
 import pytest
 
 from offpack.commands import InstallPlan
 from offpack.errors import OffpackError
 from offpack.passes import Pass, plan_passes
 from offpack.platforms import PLATFORMS, parse_platforms, parse_python_versions
-
-NPM_BASE = ("npm", "install", "--no-save", "--no-audit", "--no-fund")
 
 
 def test_parse_platforms_default_order_and_dedup():
@@ -45,22 +45,49 @@ def test_wheel_matches(platform, tag, expected):
     assert PLATFORMS[platform].wheel_matches(tag) is expected
 
 
-def test_npm_passes():
+PNPM_FLAGS = (
+    "--config.dangerously-allow-all-builds=true",
+    "--config.minimum-release-age=0",
+    "--reporter=append-only",
+    "--store-dir",
+    "/tmp/offpack/pnpm-store",
+)
+
+
+def test_npm_single_pnpm_pass():
     plan = InstallPlan("npm", ("esbuild", "@s/b@1"), ("npx", "esbuild"))
     passes = plan_passes(plan, parse_platforms("linux-x64,win-x64"), ("3.12",))
     assert passes == [
-        Pass("discovery", (*NPM_BASE, "--prefix", "/tmp/offpack/discovery", "esbuild", "@s/b@1")),
         Pass(
-            "linux-x64",
-            (*NPM_BASE, "--ignore-scripts", "--os=linux", "--cpu=x64",
-             "--prefix", "/tmp/offpack/linux-x64", "esbuild", "@s/b@1"),
-        ),
-        Pass(
-            "win-x64",
-            (*NPM_BASE, "--ignore-scripts", "--os=win32", "--cpu=x64",
-             "--prefix", "/tmp/offpack/win-x64", "esbuild", "@s/b@1"),
-        ),
+            "npm",
+            ("pnpm", "add", "esbuild", "@s/b@1",
+             "--os=current", "--os=linux", "--os=win32", "--cpu=current", "--cpu=x64",
+             *PNPM_FLAGS),
+            workdir="/tmp/offpack/npm",
+        )
     ]
+
+
+def test_npm_pass_single_platform():
+    plan = InstallPlan("npm", ("cowsay",), ("npx", "cowsay"))
+    (item,) = plan_passes(plan, parse_platforms("win-x64"), ("3.11", "3.12"))
+    assert item.argv[:6] == (
+        "pnpm", "add", "cowsay", "--os=current", "--os=win32", "--cpu=current"
+    )
+    assert item.argv[6] == "--cpu=x64"
+
+
+def test_pass_command_without_workdir_is_argv():
+    item = Pass("discovery", ("uv", "pip", "install", "ruff"))
+    assert item.command == item.argv
+
+
+def test_pass_command_runs_in_fresh_project_dir(tmp_path):
+    project = tmp_path / "npm"
+    item = Pass("npm", ("sh", "-c", "pwd; cat package.json", "it's"), workdir=str(project))
+    assert item.command[-4:] == item.argv
+    result = subprocess.run(item.command, capture_output=True, text=True, check=True)
+    assert result.stdout.split() == [str(project), "{}"]
 
 
 def test_pypi_passes():

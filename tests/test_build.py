@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -13,12 +14,32 @@ from tests.helpers import make_file, make_npm_tgz
 SQUID_LINE = "1726252800.1 1 172.18.0.3 TCP_TUNNEL/200 1 CONNECT github.com:443 - HIER_DIRECT/1.1.1.1 -\n"
 
 
+VERDACCIO_LINES = [
+    "http <-- 200, user: null(172.18.0.5), req: 'GET /esbuild', bytes: 0/337391",
+    "http <-- 200, user: null(172.18.0.5), req: 'GET /esbuild/-/esbuild-0.23.0.tgz', bytes: 0/0",
+    "http <-- 200, user: null(172.18.0.5), req: 'GET /esbuild/-/esbuild-0.23.0.tgz', bytes: 0/34207",
+    "http <-- 200, user: null(172.18.0.5), req: "
+    "'GET /@esbuild/win32-x64/-/win32-x64-0.23.0.tgz', bytes: 0/4829680",
+]
+
+
+class FakeFollower:
+    def __init__(self, compose):
+        self.compose = compose
+
+    def stop(self):
+        self.compose.calls.append("follower_stop")
+
+
 class FakeCompose:
-    def __init__(self, project, assets, *, fixtures, fail_when=None):
+    def __init__(self, project, assets, *, fixtures, fail_when=None, timeout_when=None, on_exec=None):
         self.project = project
         self.assets = assets
         self.fixtures = fixtures
         self.fail_when = fail_when
+        self.timeout_when = timeout_when
+        self.on_exec = on_exec
+        self.proxy_handler = None
         self.calls = []
 
     def up(self):
@@ -27,10 +48,23 @@ class FakeCompose:
     def wait_ready(self, timeout, interval=2.0):
         self.calls.append("wait_ready")
 
-    def exec(self, service, argv, timeout=None):
+    def follow_logs(self, services, on_line):
+        self.calls.append(("follow_logs", tuple(services)))
+        self.proxy_handler = on_line
+        return FakeFollower(self)
+
+    def exec_stream(self, service, argv, on_line, timeout=None):
         self.calls.append(("exec", tuple(argv)))
-        code = 1 if self.fail_when and self.fail_when in argv else 0
-        return subprocess.CompletedProcess(list(argv), code, "stdout\n", "stderr\n")
+        if self.timeout_when and self.timeout_when in argv:
+            raise subprocess.TimeoutExpired(list(argv), timeout)
+        on_line("stdout")
+        if self.proxy_handler is not None:
+            for line in VERDACCIO_LINES:
+                self.proxy_handler(line)
+        if self.on_exec is not None:
+            self.on_exec(argv)
+        on_line("stderr")
+        return 1 if self.fail_when and self.fail_when in argv else 0
 
     def stop(self):
         self.calls.append("stop")
@@ -62,15 +96,17 @@ def fixtures(tmp_path):
 @pytest.fixture(autouse=True)
 def no_docker_check(monkeypatch):
     monkeypatch.setattr(build_module, "ensure_docker", lambda: None)
+    monkeypatch.setattr(build_module, "PROXY_LOG_SETTLE", 0)
 
 
-def _opts(tmp_path, command=("npx", "esbuild", "--version"), sign_key=None):
+def _opts(tmp_path, command=("npx", "esbuild", "--version"), sign_key=None, verbose=False):
     return BuildOptions(
         command=command,
         platforms=parse_platforms("linux-x64,win-x64"),
         pythons=("3.12",),
         out_dir=tmp_path / "dist",
         sign_key=sign_key,
+        verbose=verbose,
     )
 
 
@@ -97,10 +133,12 @@ def test_build_creates_signed_bundle(tmp_path, fixtures, signing_key):
     )
     assert archive == tmp_path / "dist" / "esbuild-20260913-214000.tar.gz"
     compose = created[0]
-    passes = [call[1] for call in compose.calls if isinstance(call, tuple)]
-    assert len(passes) == 3
-    assert compose.calls[:2] == ["up", "wait_ready"]
-    assert compose.calls[-2:] == ["stop", "down"]
+    passes = [call[1] for call in compose.calls if call[0] == "exec"]
+    assert len(passes) == 1
+    assert passes[0][-3:] == ("--reporter=append-only", "--store-dir", "/tmp/offpack/pnpm-store")
+    assert "pnpm" in passes[0] and "--os=win32" in passes[0]
+    assert compose.calls[:3] == ["up", "wait_ready", ("follow_logs", ("verdaccio", "devpi"))]
+    assert compose.calls[-3:] == ["follower_stop", "stop", "down"]
     root = extract_bundle(archive, tmp_path / "extract")
     assert (root / "SHA256SUMS.sig").is_file()
     manifest = load_manifest(root, verify_checksums(root))
@@ -111,17 +149,81 @@ def test_build_creates_signed_bundle(tmp_path, fixtures, signing_key):
 
 def test_failed_pass_stops_stack_and_keeps_log(tmp_path, fixtures):
     created = []
-    with pytest.raises(BuildError, match="проход win-x64"):
+    lines = []
+    with pytest.raises(BuildError, match="проход npm"):
         run_build(
             _opts(tmp_path),
             compose_factory=_factory(created, fixtures=fixtures, fail_when="--os=win32"),
             now=NOW,
+            log=lines.append,
+        )
+    assert created[0].calls[-2:] == ["follower_stop", "down"]
+    log_path = tmp_path / "dist" / "esbuild-20260913-214000.log"
+    log = log_path.read_text()
+    assert re.search(r"^=== \[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] npm: pnpm add esbuild", log, re.M)
+    assert "stdout\nstderr\n" in log
+    assert any(re.fullmatch(rf"\[\d\d:\d\d\] ✗ npm: код 1 \(\d+s\), лог: {re.escape(str(log_path))}", line) for line in lines), lines
+    assert not list((tmp_path / "dist").glob("*.tar.gz"))
+
+
+def test_pass_timeout_is_build_error_and_stack_is_down(tmp_path, fixtures):
+    created = []
+    with pytest.raises(BuildError, match="превышен таймаут.*лог"):
+        run_build(
+            _opts(tmp_path),
+            compose_factory=_factory(created, fixtures=fixtures, timeout_when="pnpm"),
+            now=NOW,
             log=lambda _: None,
         )
-    assert created[0].calls[-1] == "down"
-    log = (tmp_path / "dist" / "esbuild-20260913-214000.log").read_text()
-    assert "=== win-x64" in log and "stderr" in log
-    assert not list((tmp_path / "dist").glob("*.tar.gz"))
+    assert created[0].calls[-2:] == ["follower_stop", "down"]
+
+
+def test_log_file_is_written_live(tmp_path, fixtures):
+    log_path = tmp_path / "dist" / "esbuild-20260913-214000.log"
+    seen = []
+    run_build(
+        _opts(tmp_path),
+        compose_factory=_factory([], fixtures=fixtures, on_exec=lambda argv: seen.append(log_path.read_text())),
+        now=NOW,
+        log=lambda _: None,
+    )
+    assert "npm: pnpm add" in seen[0] and seen[0].endswith("stdout\n")
+
+
+def test_progress_output(tmp_path, fixtures):
+    lines = []
+    archive = run_build(
+        _opts(tmp_path), compose_factory=_factory([], fixtures=fixtures), now=NOW, log=lines.append
+    )
+    text = "\n".join(lines)
+    stamp = r"\[\d\d:\d\d\] "
+    for pattern in [
+        rf"{stamp}✓ песочница поднята \(\d+s\)",
+        rf"{stamp}✓ сервисы готовы \(\d+s\)",
+        rf"{stamp}проход npm: pnpm add esbuild --os=current .*",
+        r"        ↓ npm  esbuild 0\.23\.0  33\.4 КБ",
+        r"        ↓ npm  @esbuild/win32-x64 0\.23\.0  4\.6 МБ",
+        rf"{stamp}✓ npm: \+2 файлов, 4\.6 МБ \(\d+s\)",
+        rf"{stamp}✓ файлы собраны \(\d+s\)",
+        rf"{stamp}✓ архив упакован \(\d+s\)",
+        rf"{stamp}npm 2 файлов \d+ Б · pypi 0 файлов 0 Б · предупреждений 1",
+    ]:
+        assert re.search(f"^{pattern}$", text, re.M), (pattern, text)
+    assert text.count("↓ npm  esbuild 0.23.0") == 1
+    assert "stdout" not in text
+    assert lines[-1].startswith("offpack: архив создан")
+    assert archive.is_file()
+
+
+def test_verbose_streams_tool_output(tmp_path, fixtures):
+    lines = []
+    run_build(
+        _opts(tmp_path, verbose=True),
+        compose_factory=_factory([], fixtures=fixtures),
+        now=NOW,
+        log=lines.append,
+    )
+    assert "          stdout" in lines and "          stderr" in lines
 
 
 def test_missing_egress_log_adds_notice(tmp_path, fixtures):
@@ -160,7 +262,7 @@ def test_unmapped_command_adds_notice(tmp_path, fixtures):
     root = extract_bundle(archive, tmp_path / "extract")
     manifest = load_manifest(root, verify_checksums(root))
     assert "unmapped_command" in [w.kind for w in manifest.warnings]
-    assert [c for c in created[0].calls if isinstance(c, tuple)] == [
+    assert [c for c in created[0].calls if c[0] == "exec"] == [
         ("exec", ("pnpm", "add", "esbuild"))
     ]
 

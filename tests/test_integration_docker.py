@@ -1,5 +1,6 @@
 """Интеграционные тесты с настоящим docker. Запуск: uv run pytest -m docker -v"""
 
+import re
 import secrets
 from contextlib import contextmanager
 
@@ -118,6 +119,7 @@ def _manifest(archive, tmp_path):
 
 
 def test_build_npm_esbuild_for_both_platforms(tmp_path):
+    lines = []
     archive = run_build(
         BuildOptions(
             command=("npx", "esbuild", "--version"),
@@ -126,13 +128,22 @@ def test_build_npm_esbuild_for_both_platforms(tmp_path):
             out_dir=tmp_path / "dist",
             sign_key=None,
             timeout=1200,
-        )
+        ),
+        log=lines.append,
     )
     names = {f.name for f in _manifest(archive, tmp_path).files}
     assert {"esbuild", "@esbuild/linux-x64", "@esbuild/win32-x64"} <= names
+    text = "\n".join(lines)
+    # список загрузок строится по настоящему логу Verdaccio
+    assert re.search(r"^        ↓ npm  @esbuild/win32-x64 \S+  [\d.]+ МБ$", text, re.M), text
+    assert re.search(r"✓ npm: \+\d+ файлов, [\d.]+ МБ", text), text
+    # установочные скрипты зависимостей выполняются в проходе pnpm
+    (log_file,) = (tmp_path / "dist").glob("*.log")
+    assert "esbuild postinstall: Done" in log_file.read_text(), log_file.read_text()
 
 
 def test_build_pypi_ruff_for_both_platforms(tmp_path):
+    lines = []
     archive = run_build(
         BuildOptions(
             command=("uv", "tool", "install", "ruff"),
@@ -141,8 +152,11 @@ def test_build_pypi_ruff_for_both_platforms(tmp_path):
             out_dir=tmp_path / "dist",
             sign_key=None,
             timeout=1200,
-        )
+        ),
+        log=lines.append,
     )
+    # список загрузок строится по настоящему логу devpi
+    assert any(line.startswith("        ↓ pypi ruff-") for line in lines), lines
     wheels = [f.path for f in _manifest(archive, tmp_path).files if f.name == "ruff"]
     assert any("manylinux" in w and "x86_64" in w for w in wheels), wheels
     assert any("win_amd64" in w for w in wheels), wheels

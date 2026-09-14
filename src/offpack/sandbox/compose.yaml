@@ -32,6 +32,8 @@ services:
     init: true
     environment:
       npm_config_registry: http://verdaccio:4873/
+      # pnpm 11 не читает npm_config_*: реестр задаётся отдельно
+      pnpm_config_registry: http://verdaccio:4873/
       UV_DEFAULT_INDEX: http://devpi:3141/root/pypi/+simple/
       PIP_INDEX_URL: http://devpi:3141/root/pypi/+simple/
       PIP_TRUSTED_HOST: devpi

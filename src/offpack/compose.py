@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -12,6 +13,8 @@ from pathlib import Path
 from offpack.errors import OffpackError
 
 Runner = Callable[..., subprocess.CompletedProcess]
+Popen = Callable[..., subprocess.Popen]
+LineHandler = Callable[[str], None]
 
 _OK_PROBE = (
     "fetch(process.argv[1]).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
@@ -49,11 +52,59 @@ def ensure_docker(runner: Runner = subprocess.run) -> None:
         raise ComposeError(f"docker compose недоступен: {result.stderr.strip()}")
 
 
+def _start_lines(popen: Popen, argv: list[str]) -> subprocess.Popen:
+    """Процесс с объединёнными stdout и stderr, читаемыми построчно."""
+    return popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+
+class LogFollower:
+    """Фоновое чтение `docker compose logs -f`: каждая строка передаётся в on_line."""
+
+    def __init__(self, process: subprocess.Popen, on_line: LineHandler) -> None:
+        self._process = process
+        self._on_line = on_line
+        self._thread = threading.Thread(target=self._pump, name="offpack-logs", daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        assert self._process.stdout is not None
+        for line in self._process.stdout:
+            self._on_line(line.rstrip("\r\n"))
+
+    def stop(self, timeout: float = 5.0) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+        try:
+            self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait()
+        self._thread.join(timeout=timeout)
+        if self._process.stdout is not None and not self._thread.is_alive():
+            self._process.stdout.close()
+
+
 class Compose:
-    def __init__(self, project: str, assets: Path, runner: Runner = subprocess.run) -> None:
+    def __init__(
+        self,
+        project: str,
+        assets: Path,
+        runner: Runner = subprocess.run,
+        popen: Popen = subprocess.Popen,
+    ) -> None:
         self.project = project
         self.assets = assets
         self._run = runner
+        self._popen = popen
 
     def _base(self) -> list[str]:
         return ["docker", "compose", "-p", self.project, "-f", str(self.assets / "compose.yaml")]
@@ -79,6 +130,55 @@ class Compose:
             text=True,
             timeout=timeout,
         )
+
+    def exec_stream(
+        self,
+        service: str,
+        argv: Sequence[str],
+        on_line: LineHandler,
+        timeout: float | None = None,
+    ) -> int:
+        """exec с построчной передачей вывода (stdout и stderr) в on_line.
+
+        По истечении timeout процесс docker убивается и поднимается
+        subprocess.TimeoutExpired. Возвращает код выхода.
+        """
+        process = _start_lines(self._popen, [*self._base(), "exec", "-T", service, *argv])
+        expired = threading.Event()
+
+        def kill() -> None:
+            expired.set()
+            process.kill()
+
+        timer = threading.Timer(timeout, kill) if timeout is not None else None
+        if timer is not None:
+            timer.daemon = True
+            timer.start()
+        try:
+            assert process.stdout is not None
+            with process.stdout:
+                for line in process.stdout:
+                    on_line(line.rstrip("\r\n"))
+            code = process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            if timer is not None:
+                timer.cancel()
+        # процесс мог завершиться сам в момент срабатывания таймера: тогда код не от kill
+        if expired.is_set() and code != 0:
+            raise subprocess.TimeoutExpired(list(argv), timeout or 0)
+        return code
+
+    def follow_logs(self, services: Sequence[str], on_line: LineHandler) -> LogFollower:
+        """Следить за логами сервисов в фоне; остановить — LogFollower.stop()."""
+        process = _start_lines(
+            self._popen,
+            [*self._base(), "logs", "-f", "--no-color", "--no-log-prefix", *services],
+        )
+        return LogFollower(process, on_line)
 
     def wait_ready(self, timeout: float, interval: float = 2.0) -> None:
         deadline = time.monotonic() + timeout

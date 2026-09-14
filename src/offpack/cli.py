@@ -64,6 +64,12 @@ def _add_build(sub: argparse._SubParsersAction) -> None:
     sign.add_argument("--no-sign", action="store_true", help="не подписывать архив")
     p.add_argument("--timeout", type=float, default=900, help="таймаут сборки, секунд")
     p.add_argument("--keep", action="store_true", help="не удалять стек после сборки")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="показывать вывод pnpm/uv по мере выполнения проходов",
+    )
     p.add_argument("command", nargs=argparse.REMAINDER, help="команда установки (после --)")
     p.set_defaults(func=_cmd_build)
 
@@ -84,6 +90,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             sign_key=sign_key,
             timeout=args.timeout,
             keep=args.keep,
+            verbose=args.verbose,
         )
     )
     print(f"готово: {archive}")

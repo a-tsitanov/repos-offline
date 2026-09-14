@@ -48,6 +48,15 @@ def test_build_parses_options(monkeypatch, tmp_path):
     assert [p.name for p in opts.platforms] == ["win-x64"]
     assert opts.pythons == ("3.11", "3.12")
     assert opts.out_dir == tmp_path
+    assert opts.verbose is False
+
+
+@pytest.mark.parametrize("flag", ["-v", "--verbose"])
+def test_build_verbose_flag(monkeypatch, flag):
+    seen = {}
+    monkeypatch.setattr(cli, "run_build", lambda opts: seen.setdefault("opts", opts))
+    assert main(["build", "--no-sign", flag, "--", "npx", "cowsay"]) == 0
+    assert seen["opts"].verbose is True
 
 
 def test_build_default_sign_key_from_env(monkeypatch, tmp_path):

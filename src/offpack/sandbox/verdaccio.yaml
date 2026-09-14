@@ -17,7 +17,8 @@ packages:
     access: $all
     publish: $nobody
     proxy: npmjs
+# level http: в лог пишется каждый запрос, offpack показывает по нему скачанные tarball
 log:
   type: stdout
   format: pretty
-  level: warn
+  level: http
